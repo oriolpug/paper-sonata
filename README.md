@@ -34,7 +34,7 @@ No conda required. A LaTeX distribution providing `pdflatex`/`bibtex` (e.g. TeX 
     pip install -r requirements.txt
     ```
 
-2.  **Environment Variables**: Create a `.env` file in the root of the project and set the keys for the providers you use:
+2.  **Environment Variables**: Copy `.env.example` to `.env` in the project root (`cp .env.example .env`; it is gitignored) and set the keys for the providers you use:
     ```env
     # Literature search (all optional). Papers are looked up in Semantic Scholar,
     # falling back to OpenAlex and then arXiv when a source is rate-limited or has
