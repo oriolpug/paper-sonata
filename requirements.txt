@@ -1,9 +1,10 @@
-google-genai
+# Mirrors pyproject.toml for users of plain `pip` + venv.
+# Preferred: `uv sync` (add `--extra frontend` for the Streamlit demo).
 joblib
 json_repair
+litellm>=1.70
 matplotlib
 numpy
-openai
 opencv-python
 pydantic
 PyMuPDF

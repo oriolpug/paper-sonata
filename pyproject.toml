@@ -1,0 +1,37 @@
+[project]
+name = "paper-orchestra"
+version = "0.1.0"
+description = "Multi-agent framework for automated AI research paper writing, usable with any LLM provider."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "joblib",
+    "json_repair",
+    "litellm>=1.70",
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "pydantic",
+    "PyMuPDF",
+    "pymupdf4llm",
+    "pyOpenSSL",
+    "pypdf",
+    "python-dotenv",
+    "requests",
+    "rich",
+    "thefuzz",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+frontend = ["streamlit"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

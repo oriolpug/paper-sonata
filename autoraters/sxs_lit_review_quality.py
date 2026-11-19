@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.pdf_utils import load_paper
 from utils.llm_backend_utils import call_llm_with_text_prompt
+from utils.llm import model_file_tag
+from utils.model_defaults import DEFAULT_EVAL_MODEL
 from autoraters.prompts.sxs_quality_prompts import sxs_lit_review_quality_system_prompt
 
 # Global lock for file writing
@@ -26,7 +28,7 @@ FILE_LOCK = threading.Lock()
 
 
 def rate_sxs_lit_review(
-    paper1_text: str, paper2_text: str, model_name: str = "gemini-3.1-pro-preview"
+    paper1_text: str, paper2_text: str, model_name: str = DEFAULT_EVAL_MODEL
 ):
     max_retries = 5
     cur_try = 0
@@ -36,35 +38,20 @@ def rate_sxs_lit_review(
 
     while (not succeed) and cur_try < max_retries:
         try:
-            if "gemini" in model_name:
-                response_dict = call_llm_with_text_prompt(
-                    prompt=prompt,
-                    model_name=model_name,
-                    generation_configs={
-                        "system_instruction": sxs_lit_review_quality_system_prompt,
-                        "temperature": 0.0,
-                    },
-                )
-                succeed = True
-                return (
-                    response_dict.get("parsed_response", response_dict)
-                    if isinstance(response_dict, dict)
-                    else response_dict
-                )
-            elif "gpt" in model_name:
-                response_dict = call_llm_with_text_prompt(
-                    prompt=prompt,
-                    model_name=model_name,
-                    generation_configs={
-                        "system_instruction": sxs_lit_review_quality_system_prompt,
-                    },
-                )
-                succeed = True
-                return (
-                    response_dict.get("parsed_response", response_dict)
-                    if isinstance(response_dict, dict)
-                    else response_dict
-                )
+            response_dict = call_llm_with_text_prompt(
+                prompt=prompt,
+                model_name=model_name,
+                generation_configs={
+                    "system_instruction": sxs_lit_review_quality_system_prompt,
+                    "temperature": 0.0,
+                },
+            )
+            succeed = True
+            return (
+                response_dict.get("parsed_response", response_dict)
+                if isinstance(response_dict, dict)
+                else response_dict
+            )
 
         except Exception as e:
             print(
@@ -183,7 +170,7 @@ def perform_sxs_lit_review_batch(
     exp1_name: str,
     exp2_name: str,
     output_folder: str = "./logs/sxs_lit_review_quality",
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     print(f"Starting Enhanced SxS Lit Review batch execution...", flush=True)
     print(f"Project 1: {project_folder_1} ({rel_path_1})", flush=True)
@@ -199,7 +186,7 @@ def perform_sxs_lit_review_batch(
 
     output_json_path = os.path.join(
         output_folder,
-        f"sxs_lit_review_enhanced_{model_name}_{exp1_name}_vs_{exp2_name}_{conference}.json",
+        f"sxs_lit_review_enhanced_{model_file_tag(model_name)}_{exp1_name}_vs_{exp2_name}_{conference}.json",
     )
 
     current_results = {}

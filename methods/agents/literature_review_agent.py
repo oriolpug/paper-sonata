@@ -20,13 +20,17 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict
 from pydantic import BaseModel
-from google.genai import types  # type: ignore
 
 from methods.prompts.literature_review_agent import (
     literature_review_agent_writter_prompt,
 )
-from utils.gemini_utils import call_gemini_with_contents, parse_gemini_latex_results
-from utils.scholar_utils import s2_title_search
+from utils.llm import is_gemini_model, web_search_tools
+from utils.llm_backend_utils import call_llm_with_contents
+from utils.llm_parsing import parse_latex
+from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
+from utils.scholar_utils import keyword_search, title_search
+
+SEARCH_BACKENDS = ("auto", "google", "s2")
 
 
 class CandidatePaper(BaseModel):
@@ -54,6 +58,8 @@ class PaperData(BaseModel):
     volume: Optional[str] = None
     pages: Optional[str] = None
     publication_date: Optional[str] = None
+    arxiv_id: Optional[str] = None
+    doi: Optional[str] = None
 
 
 class WriterOutput(BaseModel):
@@ -69,8 +75,10 @@ class HybridLiteratureAgent:
         latex_template_path: str,
         conference_guidelines_path: str,
         output_dir: str,
-        model_name: str = "gemini-3.1-pro-preview",
+        model_name: str = DEFAULT_WRITER_MODEL,
         max_workers: int = 5,
+        fast_model_name: str = DEFAULT_FAST_MODEL,
+        search_backend: str = "auto",
     ):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -84,10 +92,28 @@ class HybridLiteratureAgent:
             "conference_guidelines.md": conference_guidelines_path,
         }
         self.context_files = self._load_context_files()
-        self.google_search_tool = types.Tool(google_search=types.GoogleSearch())
+        self.fast_model_name = fast_model_name
+        self.search_backend = self._resolve_search_backend(search_backend)
 
         self.registry_lock = threading.Lock()
         self.print_lock = threading.Lock()
+
+    def _resolve_search_backend(self, backend: str) -> str:
+        backend = (backend or "auto").lower()
+        if backend not in SEARCH_BACKENDS:
+            raise ValueError(
+                f"Unknown search backend '{backend}'. Choose from {SEARCH_BACKENDS}."
+            )
+        fast_is_gemini = is_gemini_model(self.fast_model_name)
+        if backend == "auto":
+            return "google" if fast_is_gemini else "s2"
+        if backend == "google" and not fast_is_gemini:
+            print(
+                f"Warning: Google Search grounding requires a Gemini model, but the fast "
+                f"model is '{self.fast_model_name}'. Falling back to scholarly database search."
+            )
+            return "s2"
+        return backend
 
     def _safe_print(self, message: str):
         """Thread-safe printing to prevent garbled output."""
@@ -172,13 +198,20 @@ class HybridLiteratureAgent:
         if not active_tasks:
             return
 
-        self._safe_print(f"   🔎 Phase 1a: Google Candidates Discovery (MaxPool=10)...")
+        backend_label = (
+            "Google Search"
+            if self.search_backend == "google"
+            else "scholarly databases"
+        )
+        self._safe_print(
+            f"   🔎 Phase 1a: Candidate Discovery via {backend_label} (MaxPool=10)..."
+        )
         all_candidates_with_tasks = []
 
-        with ThreadPoolExecutor(max_workers=10) as executor:  # Fast for Google Search!
+        with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_task = {
                 executor.submit(
-                    self._process_search_task_google, task, outline, cutoff_date
+                    self._process_search_task, task, outline, cutoff_date
                 ): task
                 for task in active_tasks
             }
@@ -193,17 +226,14 @@ class HybridLiteratureAgent:
                             )
                 except Exception as exc:
                     self._safe_print(
-                        f"      ❌ Google Search failed for '{task['focus'][:20]}...': {exc}"
+                        f"      ❌ Candidate discovery failed for '{task['focus'][:20]}...': {exc}"
                     )
 
         self._safe_print(
-            f"   📊 Phase 1b: Semantic Scholar Enrichment (Rate-limited, sequential)..."
+            f"   📊 Phase 1b: Paper Verification & Enrichment (Semantic Scholar / OpenAlex / arXiv)..."
         )
-        import time
-
+        # Rate limiting and source fallback are handled inside utils.scholar_utils.
         for item in all_candidates_with_tasks:
-            # wait 1s per query to avoid SS rate limits!
-            time.sleep(1.0)
             self._enrich_and_register_paper(
                 item["cand"], item["task"], registry, cutoff_date
             )
@@ -302,7 +332,7 @@ class HybridLiteratureAgent:
 
         return outline
 
-    def _process_search_task_google(self, task, outline, cutoff_date) -> list:
+    def _process_search_task(self, task, outline, cutoff_date) -> list:
         if task.get("search_type") == "targeted":
             self._safe_print(
                 f"   🎯 Targeted Search [{task['section']}]: '{task['focus']}'"
@@ -335,7 +365,7 @@ class HybridLiteratureAgent:
                 return
 
         try:
-            s2_data = s2_title_search(cand_title, cand_year, cutoff_date)
+            s2_data = title_search(cand_title, cand_year, cutoff_date)
 
             if s2_data:
                 if not self._is_paper_allowed(s2_data, cutoff_date):
@@ -369,6 +399,8 @@ class HybridLiteratureAgent:
                     volume=j_info.get("volume"),
                     pages=j_info.get("pages"),
                     publication_date=s2_data.get("publicationDate"),
+                    arxiv_id=s2_data.get("arxivId"),
+                    doi=s2_data.get("doi"),
                 )
 
                 final_norm_title = self._normalize_title(full_obj.title)
@@ -424,6 +456,11 @@ class HybridLiteratureAgent:
         return True
 
     def _discover_candidates(self, task, outline, cutoff_date) -> List[CandidatePaper]:
+        if self.search_backend == "google":
+            return self._discover_candidates_google(task, outline, cutoff_date)
+        return self._discover_candidates_s2(task, outline, cutoff_date)
+
+    def _discover_candidates_google(self, task, outline, cutoff_date) -> list:
         intro_plan = outline.get("intro_related_work_plan", {}).get(
             "introduction_strategy", {}
         )
@@ -461,17 +498,127 @@ class HybridLiteratureAgent:
             {DiscoveryResult.model_json_schema()}
             """
 
-        response_dict = call_gemini_with_contents(
-            model_name="gemini-3-flash-preview",
+        response_dict = call_llm_with_contents(
+            model_name=self.fast_model_name,
             contents=[prompt],
             generation_configs={
-                "tools": [self.google_search_tool],
+                "tools": web_search_tools(self.fast_model_name),
                 "temperature": 0.1 if task.get("search_type") == "targeted" else 0.4,
             },
         )
 
         if response_dict["parsed_response"]:
             return response_dict["parsed_response"].get("candidates", [])
+        return []
+
+    def _discover_candidates_s2(self, task, outline, cutoff_date) -> list:
+        """Model-agnostic discovery: LLM writes queries, scholarly databases
+        (Semantic Scholar -> OpenAlex -> arXiv) are searched, and the LLM
+        selects relevant papers from the real search results."""
+        intro_plan = outline.get("intro_related_work_plan", {}).get(
+            "introduction_strategy", {}
+        )
+        core_problem = intro_plan.get("problem_gap_hypothesis", "N/A")
+        targeted = task.get("search_type") == "targeted"
+
+        # Step 1: generate search queries.
+        if targeted:
+            query_instructions = f"""
+            Identify the SPECIFIC academic paper described by this hint: "{task['focus']}".
+            CONTEXT: {task['context']}
+
+            If the hint refers to a dataset, model architecture, or baseline, target the
+            primary, original paper that introduced it.
+            Produce 1-3 search queries for an academic search engine.
+            The first query should be your best guess of the paper's EXACT title; the others
+            short keyword queries.
+            """
+        else:
+            query_instructions = f"""
+            We need 10-15 highly relevant, influential academic papers for this search task.
+            SEARCH TASK: {task['focus']}
+            CONTEXT FOR TASK: {task['context']}
+            BROADER PROJECT PROBLEM: {core_problem}
+
+            Produce 3-5 diverse, concise keyword queries (3-8 words each) for an academic
+            search engine. Queries may include exact titles of well-known
+            papers you are confident exist.
+            """
+        query_prompt = (
+            query_instructions
+            + '\nReturn ONLY json in a ```json``` block: {"queries": ["...", "..."]}'
+        )
+        query_response = call_llm_with_contents(
+            model_name=self.fast_model_name,
+            contents=[query_prompt],
+            generation_configs={"temperature": 0.2 if targeted else 0.5},
+        )
+        parsed = query_response["parsed_response"]
+        queries = parsed.get("queries", []) if isinstance(parsed, dict) else parsed
+        queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()]
+        if not queries:
+            queries = [task["focus"]]
+        queries = queries[: 3 if targeted else 5]
+
+        # Step 2: search scholarly databases (with source fallback).
+        found: Dict[str, Dict] = {}
+        for q in queries:
+            for r in keyword_search(
+                q, limit=10 if targeted else 20, cutoff_date=cutoff_date
+            ):
+                if not r.get("abstract"):
+                    continue
+                found.setdefault(self._normalize_title(r["title"]), r)
+        if not found:
+            return []
+
+        listing = []
+        for i, r in enumerate(found.values()):
+            abstract = (r.get("abstract") or "").replace("\n", " ")
+            if len(abstract) > 400:
+                abstract = abstract[:400] + "..."
+            listing.append(
+                f"[{i}] {r['title']} ({r.get('year') or 'n.d.'}; "
+                f"{r.get('venue') or 'unknown venue'}; "
+                f"{r.get('citationCount') or 0} citations)\n    {abstract}"
+            )
+
+        # Step 3: select relevant papers from the real search results.
+        if targeted:
+            selection_goal = (
+                f'Select EXACTLY 1 paper that best matches the hint "{task["focus"]}" '
+                "(prefer the original paper that introduced the referenced method/dataset). "
+                "If none match, return an empty candidates list."
+            )
+        else:
+            selection_goal = (
+                "Select up to 15 papers that are strictly relevant to the search task. "
+                "Prefer papers from top-tier venues, highly-cited works, or the exact "
+                "state-of-the-art. Do not force results."
+            )
+        select_prompt = f"""
+            SEARCH TASK: {task['focus']}
+            CONTEXT FOR TASK: {task['context']}
+            BROADER PROJECT PROBLEM: {core_problem}
+            CUTOFF DATE: Published BEFORE {cutoff_date}
+
+            SEARCH RESULTS:
+            {chr(10).join(listing)}
+
+            {selection_goal}
+            Copy each selected title EXACTLY as written in the search results.
+
+            YOU MUST return the results in json format (```json content```) following this schema:
+            {DiscoveryResult.model_json_schema()}
+            """
+        response_dict = call_llm_with_contents(
+            model_name=self.fast_model_name,
+            contents=[select_prompt],
+            generation_configs={"temperature": 0.1 if targeted else 0.3},
+        )
+        parsed = response_dict["parsed_response"]
+        if isinstance(parsed, dict):
+            return parsed.get("candidates", [])
         return []
 
     def _synthesize_content(self, outline, papers: List[PaperData], cutoff_date: str):
@@ -496,11 +643,11 @@ class HybridLiteratureAgent:
         )
 
         user_prompt = "Generate the LaTeX for Introduction and Related Work sections."
-        response_dict = call_gemini_with_contents(
+        response_dict = call_llm_with_contents(
             model_name=self.model_name,
             contents=[user_prompt, json.dumps(context_payload)],
             generation_configs={"system_instruction": writer_system_prompt},
-            result_parsing_func=parse_gemini_latex_results,
+            result_parsing_func=parse_latex,
         )
         return response_dict["parsed_response"]
 
@@ -551,11 +698,15 @@ class HybridLiteratureAgent:
             seen_keys.add(unique_key)
 
             author_str = " and ".join(p.authors) if p.authors else "Unknown"
-            entry_type = "article" if p.journal else "inproceedings"
+            is_preprint = not p.journal and (p.venue or "").lower().startswith("arxiv")
+            entry_type = "article" if (p.journal or is_preprint) else "inproceedings"
 
             entry = f"@{entry_type}{{{p.citation_key},\n  title={{{p.title}}},\n  author={{{author_str}}},\n"
             if p.journal:
                 entry += f"  journal={{{p.journal}}},\n"
+            elif is_preprint:
+                preprint = f"arXiv preprint arXiv:{p.arxiv_id}" if p.arxiv_id else "arXiv preprint"
+                entry += f"  journal={{{preprint}}},\n"
             else:
                 entry += f"  booktitle={{{p.venue}}},\n"
             entry += f"  year={{{p.year}}}"

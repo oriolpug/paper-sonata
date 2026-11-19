@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 from pydantic import BaseModel, Field
 
 from utils.llm_backend_utils import call_llm_with_pdf
+from utils.llm import model_file_tag
+from utils.model_defaults import DEFAULT_EVAL_MODEL
 from autoraters.prompts.lit_review_quality_prompts import (
     lit_review_quality_system_prompt,
 )
@@ -56,7 +58,7 @@ FILE_LOCK = threading.Lock()
 
 def rate_single_paper(
     paper_pdf_path: str,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
     avg_citation_count: int = 58,
 ):
     try:
@@ -128,7 +130,7 @@ def perform_batch_rating(
     output_json_path: str,
     max_workers: int = 10,
     avg_citation_count: int = 58,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     if os.path.exists(output_json_path):
         with open(output_json_path, "r") as f:
@@ -195,13 +197,13 @@ def perform_batch_rating_folder(
     root_folder: str,
     paper_rel_path="latex_writeup/final_paper.pdf",
     avg_citation_count: int = 58,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     assert os.path.exists(root_folder), "Please provide a valid folder!"
 
     all_lit_ratings_save_path = os.path.join(
         root_folder,
-        f"lit_review_quality_ratings_{model_name}_{paper_rel_path.split('/')[-1].replace('.pdf', '')}.json",
+        f"lit_review_quality_ratings_{model_file_tag(model_name)}_{paper_rel_path.split('/')[-1].replace('.pdf', '')}.json",
     )
 
     all_filename = os.listdir(root_folder)
@@ -323,7 +325,7 @@ def print_literature_review_stats(file_path):
 def perform_batch_rating_json(
     paper_info_json_path: str,
     avg_citation_count: int = 58,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     with open(paper_info_json_path, "r") as f:
         paper_infos = json.load(f)

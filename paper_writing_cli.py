@@ -18,6 +18,13 @@ import os
 import shutil
 from datetime import datetime
 
+from utils.model_defaults import DEFAULT_WRITER_MODEL, resolve_model_names
+
+MODEL_NAME_HELP = (
+    "LiteLLM model name, e.g. gemini/gemini-3.1-pro-preview, openai/gpt-5, "
+    "anthropic/claude-sonnet-5-5, ollama_chat/qwen3:32b, hosted_vllm/<model>."
+)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -51,13 +58,27 @@ def main():
     )
     parser.add_argument(
         "--writer_model_name",
-        default="gemini-3.1-pro-preview",
-        help="LLM for writer and literature agents.",
+        default=DEFAULT_WRITER_MODEL,
+        help="LLM for writer and literature agents. " + MODEL_NAME_HELP,
     )
     parser.add_argument(
         "--reflection_model_name",
-        default="gemini-3.1-pro-preview",
-        help="LLM for reflection agents.",
+        default=None,
+        help="LLM for reflection agents. Default: same as writer.",
+    )
+    parser.add_argument(
+        "--fast_model_name",
+        default=None,
+        help="Cheaper LLM for high-volume tasks (literature discovery). Default: gemini-3-flash-preview for Gemini writers, otherwise same as writer.",
+    )
+    parser.add_argument(
+        "--lit_search_backend",
+        choices=["auto", "google", "s2"],
+        default="auto",
+        help="Literature discovery backend: 'google' (Gemini Google Search grounding, "
+        "requires a Gemini fast model), 's2' (scholarly database search: Semantic Scholar, "
+        "falling back to OpenAlex and arXiv; works with any model), or 'auto' (google for "
+        "Gemini fast models, otherwise s2). Sources are set by PAPER_SEARCH_SOURCES.",
     )
     parser.add_argument(
         "--research_cutoff",
@@ -72,13 +93,15 @@ def main():
     )
     parser.add_argument(
         "--plotting_model_name",
-        default="gemini-3.1-pro-preview",
-        help="LLM for the plotting agent.",
+        default=None,
+        help="LLM for the plotting agent. Default: same as writer.",
     )
     parser.add_argument(
         "--image_model_name",
-        default="gemini-3-pro-image-preview",
-        help="Vision model if required by plotting agent.",
+        default=None,
+        help="Image generation model for conceptual diagrams (e.g. "
+        "gemini/gemini-3-pro-image-preview, openai/gpt-image-1). Use 'none' to skip diagrams. "
+        "Default: gemini-3-pro-image-preview for Gemini writers, otherwise 'none'.",
     )
     parser.add_argument(
         "--plotting_max_critic_rounds",
@@ -88,6 +111,19 @@ def main():
     )
 
     args = parser.parse_args()
+
+    models = resolve_model_names(
+        writer=args.writer_model_name,
+        reflection=args.reflection_model_name,
+        plotting=args.plotting_model_name,
+        fast=args.fast_model_name,
+        image=args.image_model_name,
+    )
+    args.reflection_model_name = models["reflection"]
+    args.plotting_model_name = models["plotting"]
+    args.fast_model_name = models["fast"]
+    args.image_model_name = models["image"]
+    print("Models: " + ", ".join(f"{k}={v}" for k, v in models.items()))
 
     if args.research_cutoff is None:
         args.research_cutoff = datetime.now().strftime("%Y-%m")
@@ -153,6 +189,8 @@ def main():
             image_model_name=args.image_model_name,
             research_cutoff=args.research_cutoff,
             plotting_max_critic_rounds=args.plotting_max_critic_rounds,
+            fast_model_name=args.fast_model_name,
+            lit_search_backend=args.lit_search_backend,
         )
     else:
         from methods.paper_writer import write_single_paper
@@ -169,6 +207,8 @@ def main():
             writer_model_name=args.writer_model_name,
             reflection_model_name=args.reflection_model_name,
             research_cutoff=args.research_cutoff,
+            fast_model_name=args.fast_model_name,
+            lit_search_backend=args.lit_search_backend,
         )
 
 

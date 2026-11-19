@@ -4,4 +4,4 @@
 *.log
 datasets/*
 paper_output*
-*.zip
+*.zip.venv/

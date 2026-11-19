@@ -27,6 +27,8 @@ import numpy as np
 import cv2
 from pypdf import PdfReader  # type: ignore
 
+from utils.model_defaults import DEFAULT_EVAL_MODEL
+
 
 def load_paper(pdf_path, num_pages=None, min_size=100):
     try:
@@ -128,7 +130,7 @@ Here is the paper text:
 
 
 def extract_reference_from_pdf_text(
-    paper_text: str, model_name: str = "gemini-3.1-pro-preview"
+    paper_text: str, model_name: str = DEFAULT_EVAL_MODEL
 ) -> str:
     from utils.llm_backend_utils import call_llm_with_text_prompt
 
@@ -145,7 +147,7 @@ def extract_reference_from_pdf_text(
 
 
 def get_paper_references_from_pdf(
-    pdf_path: str, model_name: str = "gemini-3.1-pro-preview"
+    pdf_path: str, model_name: str = DEFAULT_EVAL_MODEL
 ):
     try:
         paper_text = load_paper(pdf_path)

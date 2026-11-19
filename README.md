@@ -20,30 +20,82 @@ Acting like an orchestrated team of specialized agents, it handles outline gener
 
 ## Installation
 
-1.  **Environment Setup**: The project relies on a Conda environment named `paper_orchestra`. You can set up a similar environment with Python 3.11 and install the required dependencies.
+No conda required. A LaTeX distribution providing `pdflatex`/`bibtex` (e.g. TeX Live or MacTeX) must be on your `PATH` to compile papers.
+
+1.  **Environment Setup** (Python >= 3.11). Recommended, with [uv](https://docs.astral.sh/uv/):
     ```bash
-    conda create -n paper_orchestra python=3.11
-    conda activate paper_orchestra
+    uv sync                    # creates .venv and installs dependencies
+    uv sync --extra frontend   # also installs the Streamlit demo
+    ```
+    Or with plain `venv` + `pip`:
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
     pip install -r requirements.txt
     ```
 
-2.  **Environment Variables**: Create a `.env` file in the root of the project and add your API keys:
+2.  **Environment Variables**: Create a `.env` file in the root of the project and set the keys for the providers you use:
     ```env
-    # Add keys if you have them, otherwise leave them empty
-    # You need to specify related keys if you want to use the model
-    # For example, if you want to use Gemini models, you need to specify either VERTEX_AI_PROJECT and VERTEX_AI_LOCATION, or GEMINI_API_KEY
-    # If you want to use OpenAI models, you need to specify OPENAI_API_KEY
-    
+    # Literature search (all optional). Papers are looked up in Semantic Scholar,
+    # falling back to OpenAlex and then arXiv when a source is rate-limited or has
+    # no match. Keyless access works but is shared and often rate-limited (HTTP 429);
+    # free keys make runs faster and more complete.
     SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
-    OPENAI_API_KEY=your_openai_api_key
+    OPENALEX_API_KEY=your_openalex_api_key    # keyless: ~100 searches/day per IP
+    # PAPER_SEARCH_SOURCES=s2,openalex,arxiv  # order/subset; drop arxiv to exclude preprints-only hits
+
+    # Hosted providers: set only the ones you use
+    GEMINI_API_KEY=your_gemini_api_key
+    # ...or Gemini via Vertex AI (takes precedence for bare "gemini-*" names)
     VERTEX_AI_PROJECT=your_vertex_ai_project
     VERTEX_AI_LOCATION=your_vertex_ai_location
-    GEMINI_API_KEY=your_gemini_api_key
+    OPENAI_API_KEY=your_openai_api_key
+    ANTHROPIC_API_KEY=your_anthropic_api_key
+    OPENROUTER_API_KEY=your_openrouter_api_key
+
+    # Self-hosted / open-source models
+    OLLAMA_API_BASE=http://localhost:11434
+    HOSTED_VLLM_API_BASE=http://localhost:8000/v1
+    LM_STUDIO_API_BASE=http://localhost:1234/v1
+
+    # Optional: default models (otherwise pass them on the command line)
+    # PAPER_WRITER_MODEL=ollama_chat/qwen3:32b
+    # PAPER_FAST_MODEL=ollama_chat/qwen3:8b
+    # PAPER_IMAGE_MODEL=none
 
     # if you want to run demo and send emails to yourself at the end, set these 2 fields as well
     SMTP_EMAIL=your_email
     SMTP_PASSWORD=your_password
     ```
+
+## Choosing a Model
+
+All LLM calls go through [LiteLLM](https://docs.litellm.ai/docs/providers), so any provider it supports works. Model names use LiteLLM's `<provider>/<model>` format:
+
+| Provider | Example model name |
+|---|---|
+| Gemini API / Vertex AI | `gemini/gemini-3.1-pro-preview`, `vertex_ai/gemini-3.1-pro-preview` |
+| OpenAI | `openai/gpt-5` |
+| Anthropic | `anthropic/claude-sonnet-5-5` |
+| OpenRouter | `openrouter/<org>/<model>` |
+| Ollama | `ollama_chat/qwen3:32b` |
+| vLLM | `hosted_vllm/Qwen/Qwen3-32B` |
+| LM Studio | `lm_studio/<model>` |
+| Any OpenAI-compatible server | `openai/<model>` with `OPENAI_API_BASE` set |
+
+Bare legacy names such as `gemini-3.1-pro-preview`, `gpt-5` or `claude-...` still work.
+
+Behaviour that adapts to the model:
+*   **PDF inputs** (refinement, autoraters) are sent natively to models that accept PDFs, and as extracted text otherwise.
+*   **Images** are dropped (with a warning) for models known not to support vision. For local models LiteLLM doesn't know about, images are sent; set `PAPER_LLM_SUPPORTS_VISION=true/false` to force either behaviour.
+*   **Literature discovery** uses Gemini's Google Search grounding when the fast model is Gemini; otherwise the model writes search queries and selects papers from the real search results (`--lit_search_backend`).
+*   **Paper verification** (every cited paper, in all modes) checks Semantic Scholar, then OpenAlex, then arXiv. Papers found only on arXiv are cited as `arXiv preprint arXiv:<id>`. A source that is rate-limited is skipped for a while (`PAPER_SEARCH_COOLDOWN`, default 300s, or the server's requested wait).
+*   **Diagrams** need an image-generation model (`--image_model_name`, e.g. `gemini/gemini-3-pro-image-preview` or `openai/gpt-image-1`). With `none`, only code-generated plots are produced.
+
+Notes for local/open-source models:
+*   The pipeline sends long prompts (full template, idea, experimental log, draft paper). Use models with at least 32k context. For Ollama, the context window is set via `PAPER_OLLAMA_NUM_CTX` (default `32768`).
+*   Some providers cap output length; set `PAPER_MAX_OUTPUT_TOKENS` if full-paper LaTeX responses get truncated. `PAPER_LLM_TIMEOUT` (seconds) helps with slow local inference.
+*   `<think>...</think>` reasoning blocks from models like Qwen3 or DeepSeek-R1 are stripped automatically.
 
 ## Dataset
 
@@ -57,15 +109,26 @@ You can run the paper generation pipeline using the provided bash script or dire
 ### Using the Bash Script
 ```bash
 ./paper_writing_cli.sh
+# with another model / python launcher:
+WRITER_MODEL=ollama_chat/qwen3:32b PYTHON=.venv/bin/python ./paper_writing_cli.sh
 ```
 
 ### Using the Python CLI directly
 ```bash
-python paper_writing_cli.py \
+uv run python paper_writing_cli.py \
   --raw_materials_dir /path_to_your_raw_materials/ \
   --latex_template_dir /path_to_your_latex_template/ \
   --output_dir /path_to_your_output_folder/ \
   --use_plotting true
+```
+
+Example with a local open-source model via Ollama:
+```bash
+uv run python paper_writing_cli.py \
+  --raw_materials_dir /path_to_your_raw_materials/ \
+  --latex_template_dir templates/cvpr2025 \
+  --writer_model_name ollama_chat/qwen3:32b \
+  --use_plotting true --image_model_name none
 ```
 
 ### Key Arguments
@@ -73,8 +136,12 @@ python paper_writing_cli.py \
 *   `--latex_template_dir`: (Required) Directory containing the LaTeX template (e.g., `templates/cvpr2025`).
 *   `--output_dir`: Directory to output the generated paper. If not specified, an automatic folder with a timestamp is created.
 *   `--use_plotting`: Enable the plotting agent workflow to generate figures from code (Default: `False`).
-*   `--writer_model_name`: LLM for writer and literature agents.
-*   `--reflection_model_name`: LLM for reflection agents.
+*   `--writer_model_name`: LLM for writer and literature agents (any LiteLLM model name, see above).
+*   `--reflection_model_name`: LLM for reflection agents (default: same as writer).
+*   `--plotting_model_name`: LLM for the plotting agent (default: same as writer).
+*   `--fast_model_name`: Cheaper LLM for literature discovery (default: `gemini-3-flash-preview` for Gemini writers, otherwise same as writer).
+*   `--lit_search_backend`: `auto` (default), `google` (Gemini only) or `s2` (Semantic Scholar, any model).
+*   `--image_model_name`: Image generation model for diagrams, or `none` (default: Gemini image model for Gemini writers, otherwise `none`).
 
 ### Interactive Demo
 

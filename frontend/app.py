@@ -41,6 +41,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from methods.paper_writer import write_single_paper
 from utils.pdf_utils import pdf_to_grid_images
+from utils.model_defaults import DEFAULT_WRITER_MODEL, resolve_model_names
 
 st.set_page_config(
     page_title="Paper Orchestra - AI Paper Writer",
@@ -142,9 +143,18 @@ def render_sidebar():
         except Exception as exception_object:
             st.sidebar.error(f"Error loading example: {exception_object}")
 
-    models = ["gemini-3.1-pro-preview", "gemini-3-flash-preview"]
-    selected_model = st.sidebar.selectbox(
-        "Select Model", models, disabled=st.session_state.locked
+    selected_model = st.sidebar.text_input(
+        "Model (LiteLLM name)",
+        value=DEFAULT_WRITER_MODEL,
+        help="e.g. gemini/gemini-3.1-pro-preview, openai/gpt-5, "
+        "anthropic/claude-sonnet-5-5, ollama_chat/qwen3:32b",
+        disabled=st.session_state.locked,
+    ).strip() or DEFAULT_WRITER_MODEL
+    st.sidebar.text_input(
+        "Image model for diagrams ('none' to skip)",
+        value=resolve_model_names(writer=selected_model)["image"],
+        key="image_model_input",
+        disabled=st.session_state.locked,
     )
 
     templates = ["cvpr2025", "iclr2025"]
@@ -362,7 +372,7 @@ def handle_live_execution(
                         "--plotting_model_name",
                         selected_model,
                         "--image_model_name",
-                        "gemini-3-pro-image-preview",
+                        st.session_state.get("image_model_input") or "none",
                     ]
                 )
 

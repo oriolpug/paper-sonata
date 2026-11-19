@@ -18,6 +18,8 @@ import base64
 import concurrent.futures
 
 from utils.common_utils import load_md_file
+from utils.llm import is_disabled_model
+from utils.model_defaults import DEFAULT_IMAGE_MODEL, DEFAULT_PLOTTING_MODEL
 from utils.paper_banana_utils import (
     retrieve_few_shot_examples,
     predict_figure_content,
@@ -31,8 +33,8 @@ from utils.paper_banana_utils import (
 def process_single_figure(
     fig_plan,
     raw_materials_dir,
-    model_name="gemini-3.1-pro-preview",
-    image_model_name="gemini-3-pro-image-preview",
+    model_name=DEFAULT_PLOTTING_MODEL,
+    image_model_name=DEFAULT_IMAGE_MODEL,
     max_critic_rounds=3,
 ):
     print(f"Processing figure: {fig_plan.get('figure_id', 'Unknown')}")
@@ -46,6 +48,12 @@ def process_single_figure(
         task_name = "plot" if "chart" in plot_type or "plot" in plot_type else "diagram"
     else:
         task_name = plot_type
+
+    if task_name == "diagram" and is_disabled_model(image_model_name):
+        print(
+            f"[{fig_plan.get('figure_id', 'Unknown')}] Skipping diagram: image model is disabled."
+        )
+        return None
 
     # Gather raw material
     raw_content = ""
@@ -204,8 +212,8 @@ def process_single_figure(
 class PlottingAgent:
     def __init__(
         self,
-        model_name: str = "gemini-3.1-pro-preview",
-        image_model_name: str = "gemini-3-pro-image-preview",
+        model_name: str = DEFAULT_PLOTTING_MODEL,
+        image_model_name: str = DEFAULT_IMAGE_MODEL,
         max_critic_rounds: int = 3,
     ):
         self.model_name = model_name
@@ -239,7 +247,8 @@ class PlottingAgent:
             for future in concurrent.futures.as_completed(futures):
                 try:
                     res = future.result()
-                    results.append(res)
+                    if res:
+                        results.append(res)
                 except Exception as e:
                     plan = futures[future]
                     import traceback

@@ -20,13 +20,10 @@ import json
 import matplotlib.pyplot as plt
 import json_repair
 from typing import Dict, Any, List, Tuple
-from google.genai import types
-
-from utils.gemini_utils import (
-    call_gemini_with_text_prompt,
-    call_gemini_with_contents,
-    generate_image_with_gemini,
-)
+from utils import llm
+from utils.image_gen import generate_image
+from utils.llm_backend_utils import call_llm_with_contents, call_llm_with_text_prompt
+from utils.model_defaults import DEFAULT_IMAGE_MODEL, DEFAULT_PLOTTING_MODEL
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 PB_DIR = os.path.join(cur_dir, "../../PaperBanana")
@@ -335,7 +332,7 @@ def retrieve_few_shot_examples(
     task_name: str,
     raw_content: str,
     description: str,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
 ) -> List[Dict]:
     """
     Retrieves Top-10 relevant examples from PaperBanana reference dataset.
@@ -375,10 +372,10 @@ def retrieve_few_shot_examples(
 
     user_prompt += "Now, based on the Target Input and the Candidate Pool, select the Top 10 most relevant examples."
 
-    response_dict = call_gemini_with_contents(
+    response_dict = call_llm_with_contents(
         contents=[
-            types.Part.from_text(text=system_prompt),
-            types.Part.from_text(text=user_prompt),
+            llm.text(system_prompt),
+            llm.text(user_prompt),
         ],
         model_name=model_name,
         result_parsing_func=identity_parse,
@@ -403,7 +400,7 @@ def generate_figure_caption(
     description: str,
     figure_desc: str,
     base64_image: str = None,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
 ) -> str:
     """
     Generates a caption for the figure based on its final description and context.
@@ -434,12 +431,10 @@ def generate_figure_caption(
 
     if base64_image and len(base64_image) > 100:
         contents = [
-            types.Part.from_text(text=prompt),
-            types.Part.from_bytes(
-                data=base64.b64decode(base64_image), mime_type="image/jpeg"
-            ),
+            llm.text(prompt),
+            llm.image(base64.b64decode(base64_image), mime_type="image/jpeg"),
         ]
-        response_dict = call_gemini_with_contents(
+        response_dict = call_llm_with_contents(
             contents=contents,
             model_name=model_name,
             result_parsing_func=identity_parse,
@@ -447,7 +442,7 @@ def generate_figure_caption(
             check_parsed_response_not_none=True,
         )
     else:
-        response_dict = call_gemini_with_text_prompt(
+        response_dict = call_llm_with_text_prompt(
             prompt=prompt,
             model_name=model_name,
             result_parsing_func=identity_parse,
@@ -469,7 +464,7 @@ def predict_figure_content(
     raw_content: str,
     description: str,
     examples: List[Dict],
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
 ) -> str:
     """
     Predicts the detailed figure description using LLM and few-shot examples.
@@ -484,7 +479,7 @@ def predict_figure_content(
         visual_intent_label = "Diagram Caption"
 
     user_prompt = ""
-    contents = [types.Part.from_text(text=system_prompt)]
+    contents = [llm.text(system_prompt)]
 
     for idx, item in enumerate(examples):
         user_prompt += f"Example {idx+1}:\n"
@@ -495,7 +490,7 @@ def predict_figure_content(
 
         user_prompt += f"{content_label}: {item_content}\n"
         user_prompt += f"{visual_intent_label}: {item.get('visual_intent', item.get('caption', ''))}\nReference {task_name.capitalize()}: "
-        contents.append(types.Part.from_text(text=user_prompt))
+        contents.append(llm.text(user_prompt))
 
         # Resolve related image base64
         image_path = os.path.join(
@@ -505,9 +500,7 @@ def predict_figure_content(
             with open(image_path, "rb") as f:
                 ref_image_base64 = base64.b64encode(f.read()).decode("utf-8")
                 contents.append(
-                    types.Part.from_bytes(
-                        data=base64.b64decode(ref_image_base64), mime_type="image/jpeg"
-                    )
+                    llm.image(base64.b64decode(ref_image_base64), mime_type="image/jpeg")
                 )
 
         user_prompt = ""
@@ -521,9 +514,9 @@ def predict_figure_content(
         user_prompt += " (do not include figure titles)"
     user_prompt += ":"
 
-    contents.append(types.Part.from_text(text=user_prompt))
+    contents.append(llm.text(user_prompt))
 
-    response_dict = call_gemini_with_contents(
+    response_dict = call_llm_with_contents(
         contents=contents,
         model_name=model_name,
         result_parsing_func=identity_parse,
@@ -536,7 +529,7 @@ def style_figure_content(
     raw_content: str,
     description: str,
     figure_desc: str,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
 ) -> str:
     """
     Refines the basic figure description into a professionally styled description.
@@ -562,10 +555,10 @@ def style_figure_content(
     user_prompt += f"{context_labels[0]}: {raw_content}\n"
     user_prompt += f"{context_labels[1]}: {description}\nYour Output:"
 
-    response_dict = call_gemini_with_contents(
+    response_dict = call_llm_with_contents(
         contents=[
-            types.Part.from_text(text=system_prompt),
-            types.Part.from_text(text=user_prompt),
+            llm.text(system_prompt),
+            llm.text(user_prompt),
         ],
         model_name=model_name,
         result_parsing_func=identity_parse,
@@ -580,7 +573,7 @@ def critique_and_revise_figure(
     figure_desc: str,
     base64_image: str,
     round_idx: int,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
 ) -> Tuple[str, str]:
     """
     Critiques the generated figure and provides revised descriptions.
@@ -595,27 +588,23 @@ def critique_and_revise_figure(
         context_labels = ["Methodology Section", "Figure Caption"]
 
     contents = [
-        types.Part.from_text(text=system_prompt),
-        types.Part.from_text(text=critique_target),
+        llm.text(system_prompt),
+        llm.text(critique_target),
     ]
 
     if base64_image and len(base64_image) > 100:
         contents.append(
-            types.Part.from_bytes(
-                data=base64.b64decode(base64_image), mime_type="image/jpeg"
-            )
+            llm.image(base64.b64decode(base64_image), mime_type="image/jpeg")
         )
     else:
         contents.append(
-            types.Part.from_text(
-                text="\n[SYSTEM NOTICE] The plot image could not be generated based on the current description (likely due to invalid code). Please check the description for errors (e.g., syntax issues, missing data) and provide a revised version."
-            )
+            llm.text("\n[SYSTEM NOTICE] The plot image could not be generated based on the current description (likely due to invalid code). Please check the description for errors (e.g., syntax issues, missing data) and provide a revised version.")
         )
 
     user_prompt = f"\nDetailed Description: {figure_desc}\n{context_labels[0]}: {raw_content}\n{context_labels[1]}: {description}\nYour Output:"
-    contents.append(types.Part.from_text(text=user_prompt))
+    contents.append(llm.text(user_prompt))
 
-    response_dict = call_gemini_with_contents(
+    response_dict = call_llm_with_contents(
         contents=contents,
         model_name=model_name,
         result_parsing_func=identity_parse,
@@ -646,8 +635,8 @@ def critique_and_revise_figure(
 def generate_figure_visuals(
     task_name: str,
     figure_description: str,
-    model_name: str = "gemini-3.1-pro-preview",
-    image_model_name: str = "gemini-3-pro-image-preview",
+    model_name: str = DEFAULT_PLOTTING_MODEL,
+    image_model_name: str = DEFAULT_IMAGE_MODEL,
     aspect_ratio: str = "16:9",
 ) -> str:
     """
@@ -656,10 +645,10 @@ def generate_figure_visuals(
     if task_name == "plot":
         prompt_text = f"Use python matplotlib to generate a statistical plot based on the following detailed description: {figure_description}\n Only provide the code without any explanations. Code:"
         contents = [
-            types.Part.from_text(text=PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT),
-            types.Part.from_text(text=prompt_text),
+            llm.text(PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT),
+            llm.text(prompt_text),
         ]
-        response_dict = call_gemini_with_contents(
+        response_dict = call_llm_with_contents(
             contents=contents,
             model_name=model_name,
             result_parsing_func=identity_parse,
@@ -671,11 +660,9 @@ def generate_figure_visuals(
         # Prompt for diagram image generation
         prompt_text = f"Render an image based on the following detailed description: {figure_description}\n Note that do not include figure titles in the image. Diagram: "
 
-        return generate_image_with_gemini(
+        return generate_image(
             model_name=image_model_name,
             prompt=prompt_text,
             aspect_ratio=aspect_ratio,
-            generation_configs={
-                "system_instruction": DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
-            },
+            system_prompt=DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT,
         )

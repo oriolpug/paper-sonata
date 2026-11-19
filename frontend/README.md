@@ -8,12 +8,13 @@ This directory contains the Streamlit frontend for Paper Orchestra.
 2. Navigate to the project root directory:
    ```bash
    cd paper-orchestra
-   conda activate paper_orchestra
+   uv sync --extra frontend
    ```
 3. Run the Streamlit application:
    ```bash
-   streamlit run frontend/app.py
+   uv run streamlit run frontend/app.py
    ```
+   (or `streamlit run frontend/app.py` from an activated `.venv`)
 4. Open the URL provided in the terminal (usually `http://localhost:8501` or similar) in your browser.
 
 ## How to Kill Unfinished Writing Processes

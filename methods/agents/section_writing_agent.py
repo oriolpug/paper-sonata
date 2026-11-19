@@ -33,8 +33,9 @@ import json
 from typing import List, Dict
 
 from methods.prompts.section_writing_agent import section_writing_agent_prompt
-from utils.gemini_utils import parse_gemini_latex_results
 from utils.llm_backend_utils import call_llm_with_images
+from utils.llm_parsing import parse_latex
+from utils.model_defaults import DEFAULT_WRITER_MODEL
 
 import json
 from typing import List, Dict
@@ -50,7 +51,7 @@ class SectionWritingAgent:
         citation_map_path: str,
         figures_info_path: str,
         guidelines_path: str,
-        model_name: str = "gemini-3.1-pro-preview",
+        model_name: str = DEFAULT_WRITER_MODEL,
     ):
 
         self.model_name = model_name
@@ -206,7 +207,7 @@ Here are the input materials for the paper.
                 "temperature": 0.7,
             },
             model_name=self.model_name,
-            result_parsing_func=parse_gemini_latex_results,
+            result_parsing_func=parse_latex,
             check_parsed_response_not_none=True,
         )
         cleaned_latex = response_dict["parsed_response"]

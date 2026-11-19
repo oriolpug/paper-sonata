@@ -29,6 +29,8 @@ from utils.pdf_utils import get_paper_references_from_pdf, load_paper
 from utils.common_utils import create_log_folder
 from utils.content_parsing_utils import extract_paper_title_from_citation
 from utils.llm_backend_utils import call_llm_with_text_prompt
+from utils.llm import model_file_tag
+from utils.model_defaults import DEFAULT_EVAL_MODEL
 
 from dotenv import load_dotenv  # type: ignore
 
@@ -38,7 +40,7 @@ load_dotenv(dot_file)
 DATASET_DIR = os.path.join(os.path.dirname(__file__), "../datasets")
 
 S2_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-print(f"Loaded S2 API Key for this project: {S2_API_KEY}")
+print(f"Semantic Scholar API key: {'set' if S2_API_KEY else 'not set'}")
 
 PRIORITY_PROMPT = """You are an expert academic reviewer. Read the following paper text and analyze its references.
 Your goal is to categorize the provided references into two priorities:
@@ -76,7 +78,7 @@ class ReferenceF1V1Evaluator:
         self,
         api_key: str = S2_API_KEY,
         log_folder: str = None,
-        model_name: str = "gemini-3.1-pro-preview",
+        model_name: str = DEFAULT_EVAL_MODEL,
     ):
         # Semantic Scholar API endpoint
         self.S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -366,7 +368,7 @@ def get_citation_f1_metrics(
     generated_pdf: str,
     log_folder=None,
     gt_cache_path: str = None,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     """
     Computes priority-based citation F1. Caches Ground Truth processing to avoid redundant LLM/API calls.
@@ -376,7 +378,7 @@ def get_citation_f1_metrics(
     # --- 1. Handle Ground Truth (With Caching) ---
     if not gt_cache_path:
         gt_cache_path = (
-            os.path.splitext(original_pdf)[0] + f"_gt_citations_{model_name}.json"
+            os.path.splitext(original_pdf)[0] + f"_gt_citations_{model_file_tag(model_name)}.json"
         )
     print(f"Using GT cache path: {gt_cache_path}")
 
@@ -446,7 +448,7 @@ def generate_gt_citations_batch(
     progress_json_path: str = None,
     max_workers: int = 5,
     evaluator_log_folder: str = None,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     """
     Given a folder of papers (e.g., cvpr2025), iterates through its subfolders.
@@ -534,7 +536,7 @@ def generate_gt_citations_batch(
             return
 
         output_json_path = os.path.join(
-            target_subfolder, f"original_paper_gt_citations_{model_name}.json"
+            target_subfolder, f"original_paper_gt_citations_{model_file_tag(model_name)}.json"
         )
 
         gt_data = None
@@ -663,11 +665,11 @@ def review_citation_f1_batch(
     output_folder: str = None,
     gen_paper_rel_path: str = "latex_writeup/final_paper.pdf",
     max_workers: int = 5,
-    model_name: str = "gemini-3.1-pro-preview",
+    model_name: str = DEFAULT_EVAL_MODEL,
 ):
     all_results = {}
     all_results_dump_path = os.path.join(
-        project_folder, f"citation_f1_results_{model_name}.json"
+        project_folder, f"citation_f1_results_{model_file_tag(model_name)}.json"
     )
 
     if os.path.exists(all_results_dump_path):
@@ -731,7 +733,7 @@ def review_citation_f1_batch(
             gt_cache_path = os.path.join(
                 paper_folder,
                 "raw_materials",
-                f"original_paper_gt_citations_{model_name}.json",
+                f"original_paper_gt_citations_{model_file_tag(model_name)}.json",
             )
 
             result_metrics = get_citation_f1_metrics(
