@@ -173,10 +173,21 @@ def _model_capability(model_name: str, key: str) -> Optional[bool]:
     return None if value is None else bool(value)
 
 
+def is_chatgpt_plan_model(model_name: str) -> bool:
+    """`chatgpt/<model>`: the user's ChatGPT plan via Sign in with ChatGPT.
+
+    Handled by utils.chatgpt_backend (official Responses API), never by
+    LiteLLM's own `chatgpt/` provider.
+    """
+    return str(model_name).strip().startswith("chatgpt/")
+
+
 def supports_vision(model_name: str) -> Optional[bool]:
     override = _env_flag("PAPER_LLM_SUPPORTS_VISION")
     if override is not None:
         return override
+    if is_chatgpt_plan_model(model_name):
+        return None  # depends on the plan's model catalog; send and see
     return _model_capability(model_name, "supports_vision")
 
 
@@ -184,6 +195,8 @@ def supports_pdf_input(model_name: str) -> bool:
     override = _env_flag("PAPER_LLM_SUPPORTS_PDF")
     if override is not None:
         return override
+    if is_chatgpt_plan_model(model_name):
+        return True  # Responses API accepts inline files for models that support them
     return bool(_model_capability(model_name, "supports_pdf_input"))
 
 
@@ -373,10 +386,29 @@ def call_llm(
     drop_images = False
     messages = build_messages(contents, model, system_prompt)
 
+    chatgpt_plan = is_chatgpt_plan_model(model)
+    if chatgpt_plan:
+        from utils import chatgpt_auth, chatgpt_backend
+
+        non_retryable: tuple = (
+            chatgpt_backend.ChatGPTPlanError,
+            chatgpt_auth.ChatGPTAuthError,
+        )
+        # temperature / tools / max_tokens are not supported with ChatGPT plan
+        # usage and are dropped (like litellm.drop_params for other providers).
+    else:
+        non_retryable = ()
+
     for attempt in range(max_retries):
         try:
-            response = litellm.completion(model=model, messages=messages, **params)
-            raw_response = _extract_text(response)
+            if chatgpt_plan:
+                raw_response = _THINK_RE.sub(
+                    "",
+                    chatgpt_backend.complete(model, messages, timeout=params.get("timeout")),
+                )
+            else:
+                response = litellm.completion(model=model, messages=messages, **params)
+                raw_response = _extract_text(response)
             if raw_response is None:
                 raise ValueError(f"Empty response from model '{model}'")
 
@@ -392,6 +424,7 @@ def call_llm(
             litellm.ContextWindowExceededError,
             litellm.AuthenticationError,
             litellm.NotFoundError,
+            *non_retryable,
         ) as e:
             print(f"Error: LLM call (model={model}) failed with non-retryable error: {e}")
             raise

@@ -81,6 +81,12 @@ def generate_image(
         return None
 
     model = normalize_model_name(model_name)
+    if model.startswith("chatgpt/"):
+        print(
+            "Image generation is not available with ChatGPT plan usage; skipping diagram. "
+            "Use an API image model (e.g. openai/gpt-image-1) or 'none'."
+        )
+        return None
     full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
     params = _image_params(model, aspect_ratio)
     params.update(

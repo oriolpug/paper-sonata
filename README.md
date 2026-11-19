@@ -82,6 +82,7 @@ All LLM calls go through [LiteLLM](https://docs.litellm.ai/docs/providers), so a
 | vLLM | `hosted_vllm/Qwen/Qwen3-32B` |
 | LM Studio | `lm_studio/<model>` |
 | Any OpenAI-compatible server | `openai/<model>` with `OPENAI_API_BASE` set |
+| Your ChatGPT plan (Plus/Pro), no API key | `chatgpt/<model>` (see below) |
 
 Bare legacy names such as `gemini-3.1-pro-preview`, `gpt-5` or `claude-...` still work.
 
@@ -93,6 +94,21 @@ Behaviour that adapts to the model:
 *   **Citation recovery**: when a suggested paper can't be found by title, the fast model proposes corrected titles/queries, the databases are searched again, and the model picks the real paper or rejects the candidate as non-existent. Limited to `--max_citation_recoveries` attempts per run (default 40, `0` disables). Every recovered and rejected candidate, with the reason, is listed in `literature_agent_output/candidate_verification.json`.
 *   **No API keys are required.** Keyless Semantic Scholar shares one global pool and is often fully rate-limited; OpenAlex title checks (autocomplete + lookup by ID) don't use its daily budget, only keyword searches do; arXiv is free but slow (1 request / 3 s).
 *   **Diagrams** need an image-generation model (`--image_model_name`, e.g. `gemini/gemini-3-pro-image-preview` or `openai/gpt-image-1`). With `none`, only code-generated plots are produced.
+
+### Using your ChatGPT plan instead of an API key
+
+ChatGPT Plus/Pro subscribers can run the pipeline on their plan through OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source) for open-source apps (currently a preview feature):
+
+```bash
+uv run python -m utils.chatgpt_auth login    # "Continue with ChatGPT" in your browser (one time)
+uv run python -m utils.chatgpt_auth models   # models available to your plan
+uv run python paper_writing_cli.py ... --writer_model_name chatgpt/<model-slug>
+```
+
+*   Usage counts against your ChatGPT plan: on Plus the 5-hour limit is shared with ChatGPT and your other apps; Pro has no 5-hour limit. Review usage or set a limit for this app at https://chatgpt.com/settings/usage. When the limit is hit, the run stops with a message instead of switching to paid API usage.
+*   Image generation is not available on plan usage: diagrams need an API image model (`--image_model_name openai/gpt-image-1` or a Gemini image model) or `none`. `temperature` and output-length settings are ignored.
+*   Credentials are stored with owner-only permissions in `~/.config/paper-orchestra/` (override with `PAPER_CHATGPT_CONFIG_DIR`) and refreshed automatically. `uv run python -m utils.chatgpt_auth logout` revokes and deletes them.
+*   This uses OpenAI's documented flow, not LiteLLM's built-in `chatgpt/` provider (which reuses Codex CLI credentials). Claude Pro/Max subscriptions can't be used this way; Anthropic only permits API keys for third-party tools.
 
 Notes for local/open-source models:
 *   The pipeline sends long prompts (full template, idea, experimental log, draft paper). Use models with at least 32k context. For Ollama, the context window is set via `PAPER_OLLAMA_NUM_CTX` (default `32768`).

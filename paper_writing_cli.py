@@ -22,7 +22,8 @@ from utils.model_defaults import DEFAULT_WRITER_MODEL, resolve_model_names
 
 MODEL_NAME_HELP = (
     "LiteLLM model name, e.g. gemini/gemini-3.1-pro-preview, openai/gpt-5, "
-    "anthropic/claude-sonnet-5-5, ollama_chat/qwen3:32b, hosted_vllm/<model>."
+    "anthropic/claude-sonnet-5-5, ollama_chat/qwen3:32b, hosted_vllm/<model>, "
+    "chatgpt/<model> (your ChatGPT plan; run `python -m utils.chatgpt_auth login` first)."
 )
 
 

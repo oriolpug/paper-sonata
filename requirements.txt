@@ -3,6 +3,8 @@
 joblib
 json_repair
 litellm>=1.70
+openai>=1.60
+PyJWT[crypto]
 matplotlib
 numpy
 opencv-python
