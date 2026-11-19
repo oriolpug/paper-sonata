@@ -41,7 +41,7 @@ No conda required. A LaTeX distribution providing `pdflatex`/`bibtex` (e.g. TeX 
     # no match. Keyless access works but is shared and often rate-limited (HTTP 429);
     # free keys make runs faster and more complete.
     SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
-    OPENALEX_API_KEY=your_openalex_api_key    # keyless: ~100 searches/day per IP
+    OPENALEX_API_KEY=your_openalex_api_key    # keyless: ~100 keyword searches/day per IP
     # PAPER_SEARCH_SOURCES=s2,openalex,arxiv  # order/subset; drop arxiv to exclude preprints-only hits
 
     # Hosted providers: set only the ones you use
@@ -89,7 +89,9 @@ Behaviour that adapts to the model:
 *   **PDF inputs** (refinement, autoraters) are sent natively to models that accept PDFs, and as extracted text otherwise.
 *   **Images** are dropped (with a warning) for models known not to support vision. For local models LiteLLM doesn't know about, images are sent; set `PAPER_LLM_SUPPORTS_VISION=true/false` to force either behaviour.
 *   **Literature discovery** uses Gemini's Google Search grounding when the fast model is Gemini; otherwise the model writes search queries and selects papers from the real search results (`--lit_search_backend`).
-*   **Paper verification** (every cited paper, in all modes) checks Semantic Scholar, then OpenAlex, then arXiv. Papers found only on arXiv are cited as `arXiv preprint arXiv:<id>`. A source that is rate-limited is skipped for a while (`PAPER_SEARCH_COOLDOWN`, default 300s, or the server's requested wait).
+*   **Paper verification** (every cited paper, in all modes) checks Semantic Scholar, then OpenAlex, then arXiv, and runs in the background while discovery is still going. When a paper exists in several versions, the published one is preferred over the preprint; papers found only on arXiv are cited as `arXiv preprint arXiv:<id>`. A source that is rate-limited is skipped for a while (`PAPER_SEARCH_COOLDOWN`, default 300s, or the server's requested wait).
+*   **Citation recovery**: when a suggested paper can't be found by title, the fast model proposes corrected titles/queries, the databases are searched again, and the model picks the real paper or rejects the candidate as non-existent. Limited to `--max_citation_recoveries` attempts per run (default 40, `0` disables). Every recovered and rejected candidate, with the reason, is listed in `literature_agent_output/candidate_verification.json`.
+*   **No API keys are required.** Keyless Semantic Scholar shares one global pool and is often fully rate-limited; OpenAlex title checks (autocomplete + lookup by ID) don't use its daily budget, only keyword searches do; arXiv is free but slow (1 request / 3 s).
 *   **Diagrams** need an image-generation model (`--image_model_name`, e.g. `gemini/gemini-3-pro-image-preview` or `openai/gpt-image-1`). With `none`, only code-generated plots are produced.
 
 Notes for local/open-source models:

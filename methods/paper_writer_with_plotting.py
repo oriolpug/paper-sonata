@@ -23,7 +23,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from concurrent.futures import ThreadPoolExecutor
 from methods.agents.outline_agent import OutlineAgent
-from methods.agents.literature_review_agent import HybridLiteratureAgent
+from methods.agents.literature_review_agent import (
+    DEFAULT_MAX_CITATION_RECOVERIES,
+    HybridLiteratureAgent,
+)
 from methods.agents.section_writing_agent import SectionWritingAgent
 from methods.agents.content_refinement_agent import ContentRefinementAgent
 from methods.agents.plotting_agent import PlottingAgent
@@ -53,6 +56,7 @@ def write_single_paper(
     plotting_max_critic_rounds: int = 3,
     fast_model_name: str = DEFAULT_FAST_MODEL,
     lit_search_backend: str = "auto",
+    max_citation_recoveries: int = DEFAULT_MAX_CITATION_RECOVERIES,
 ):
     latex_writeup_dir = osp.join(base_dir, "latex_writeup")
     pdf_file = osp.join(base_dir, "final_paper.pdf")
@@ -135,6 +139,7 @@ def write_single_paper(
                     max_workers=3,
                 fast_model_name=fast_model_name,
                 search_backend=lit_search_backend,
+                max_citation_recoveries=max_citation_recoveries,
                 )
                 literature_agent.run(
                     outline_path=outline_file_path,

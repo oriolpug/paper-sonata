@@ -94,34 +94,70 @@ def test_s2_keyword_search_filters_cutoff_retries_429_and_caches(monkeypatch):
     assert hit["venue"] == "CVPR" and len(calls) == 2
 
 
+AUTOCOMPLETE = {"results": [
+    {"id": "https://openalex.org/W1", "display_name": "Attention Is All You Need", "cited_by_count": 150000},
+    {"id": "https://openalex.org/W9", "display_name": "Something Else Entirely", "cited_by_count": 5},
+]}
+
+
 def test_fallback_to_openalex_then_cooldown_skips_s2(monkeypatch):
     calls = route(monkeypatch, {
         "semanticscholar": lambda p: _Rsp(429),
-        "openalex": lambda p: _Rsp(200, {"results": [OPENALEX_WORK]}),
+        "autocomplete": lambda p: _Rsp(200, AUTOCOMPLETE),
+        "openalex.org/works/W": lambda p: _Rsp(200, OPENALEX_WORK),
+        "openalex.org/works": lambda p: _Rsp(200, {"results": [OPENALEX_WORK]}),
     })
     hit = su.title_search("Attention Is All You Need", 2017, "2024-10")
     assert hit["source"] == "openalex"
     assert hit["venue"] == "arXiv" and hit["arxivId"] == "1706.03762"
     assert hit["abstract"] == "The dominant models"
     assert hit["authors"] == [{"name": "Ashish Vaswani"}]
+    # free path: autocomplete + one per-work fetch (non-matching hit not fetched)
+    assert [k for k, _ in calls if "openalex" in k or "autocomplete" in k] == [
+        "autocomplete", "openalex.org/works/W"]
     s2_calls = sum(1 for k, _ in calls if k == "semanticscholar")
 
     su._paper_cache.clear()
     su.keyword_search("transformers attention")
     # S2 is in cooldown, so it is not contacted again
     assert sum(1 for k, _ in calls if k == "semanticscholar") == s2_calls
+    assert calls[-1][0] == "openalex.org/works"
     assert calls[-1][1]["filter"].startswith("title_and_abstract.search:")
+
+
+def test_prefers_published_version_and_requires_abstract(monkeypatch):
+    published = dict(OPENALEX_WORK, cited_by_count=10, abstract_inverted_index=None,
+                     primary_location={"landing_page_url": "https://doi.org/x",
+                                       "source": {"display_name": "NeurIPS", "type": "conference"}})
+    works = {"W1": OPENALEX_WORK, "W2": published}
+    route(monkeypatch, {
+        "semanticscholar": lambda p: _Rsp(429),
+        "autocomplete": lambda p: _Rsp(200, {"results": [
+            {"id": "https://openalex.org/W1", "display_name": "Attention Is All You Need", "cited_by_count": 150000},
+            {"id": "https://openalex.org/W2", "display_name": "Attention is all you need", "cited_by_count": 10},
+        ]}),
+        "openalex.org/works/W": lambda p: None,
+    })
+    import utils.scholar_utils as mod
+    monkeypatch.setattr(mod, "_openalex_get_work", lambda wid: mod._openalex_normalize(works[wid.rsplit("/", 1)[-1]]))
+
+    hit = su.title_search("Attention Is All You Need", 2017, "2024-10")
+    assert hit["venue"] == "NeurIPS"  # published beats the more-cited preprint
+
+    su._paper_cache.clear()
+    hit = su.title_search("Attention Is All You Need", 2017, "2024-10", require_abstract=True)
+    assert hit["venue"] == "arXiv" and hit["abstract"]  # published one has no abstract
 
 
 def test_long_retry_after_falls_back_immediately(monkeypatch):
     calls = route(monkeypatch, {
         "semanticscholar": lambda p: _Rsp(404),
-        "openalex": lambda p: _Rsp(429, {"retryAfter": 35}),
+        "autocomplete": lambda p: _Rsp(429, {"retryAfter": 35}),
         "arxiv": lambda p: _Rsp(200, content=ARXIV_XML),
     })
     hit = su.title_search("Deep Residual Learning for Image Recognition", 2016, "2024-10")
     assert hit["source"] == "arxiv"
-    assert sum(1 for k, _ in calls if k == "openalex") == 1  # no retries on 35s wait
+    assert sum(1 for k, _ in calls if k == "autocomplete") == 1  # no retries on 35s wait
     assert su._in_cooldown("openalex")
 
 
@@ -143,6 +179,7 @@ def test_arxiv_parsing_and_queries(monkeypatch):
 def test_no_results_anywhere(monkeypatch):
     route(monkeypatch, {
         "semanticscholar": lambda p: _Rsp(200, {"data": []}),
+        "autocomplete": lambda p: _Rsp(200, {"results": []}),
         "openalex": lambda p: _Rsp(200, {"results": []}),
         "arxiv": lambda p: _Rsp(200, content=b"<feed xmlns='http://www.w3.org/2005/Atom'/>"),
     })
@@ -208,7 +245,7 @@ def test_preprint_bibtex(monkeypatch, tmp_path):
 
     agent = _agent(tmp_path)
     registry = {}
-    monkeypatch.setattr(lra, "title_search", lambda t, y, c: {
+    monkeypatch.setattr(lra, "title_search", lambda t, y, c, **kw: {
         "title": "Attention Is All You Need", "authors": [{"name": "Ashish Vaswani"}],
         "venue": "arXiv", "year": 2017, "abstract": "abs", "citationCount": 0,
         "journal": None, "publicationDate": "2017-06-12", "arxivId": "1706.03762",

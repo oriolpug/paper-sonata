@@ -31,6 +31,8 @@ from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
 from utils.scholar_utils import keyword_search, title_search
 
 SEARCH_BACKENDS = ("auto", "google", "s2")
+# LLM-assisted recovery attempts per run for candidates not found by title.
+DEFAULT_MAX_CITATION_RECOVERIES = int(os.getenv("PAPER_MAX_CITATION_RECOVERIES", "40"))
 
 
 class CandidatePaper(BaseModel):
@@ -79,12 +81,21 @@ class HybridLiteratureAgent:
         max_workers: int = 5,
         fast_model_name: str = DEFAULT_FAST_MODEL,
         search_backend: str = "auto",
+        max_citation_recoveries: int = DEFAULT_MAX_CITATION_RECOVERIES,
     ):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
         self.model_name = model_name
-        self.max_workers = max_workers
+        # Number of background workers verifying candidates (lookups are
+        # additionally rate-limited per source in utils.scholar_utils).
+        self.max_workers = max(1, max_workers)
+        # Max LLM-assisted recovery attempts for candidates that could not be
+        # found by title (0 disables recovery).
+        self.max_citation_recoveries = max(0, max_citation_recoveries)
+        self._recoveries_used = 0
+        self._inflight_titles = set()
+        self.verification_log = {"recovered": [], "rejected": []}
         self.context_paths = {
             "idea.md": idea_path,
             "experimental_log.md": experimental_log_path,
@@ -152,8 +163,11 @@ class HybridLiteratureAgent:
         )
 
         self._safe_print(
-            f"\n✨ Final Count: {len(unique_papers_registry)} unique enriched papers retrieved."
+            f"\n✨ Final Count: {len(unique_papers_registry)} unique enriched papers retrieved "
+            f"({len(self.verification_log['recovered'])} recovered, "
+            f"{len(self.verification_log['rejected'])} candidates rejected)."
         )
+        self._save_verification_log(len(unique_papers_registry))
 
         # --- PHASE 2: ASSET GENERATION ---
         final_papers_list = list(unique_papers_registry.values())
@@ -204,39 +218,53 @@ class HybridLiteratureAgent:
             else "scholarly databases"
         )
         self._safe_print(
-            f"   🔎 Phase 1a: Candidate Discovery via {backend_label} (MaxPool=10)..."
+            f"   🔎 Candidate discovery via {backend_label} (10 threads), verifying "
+            f"candidates in the background ({self.max_workers} workers: "
+            f"Semantic Scholar / OpenAlex / arXiv)..."
         )
-        all_candidates_with_tasks = []
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_task = {
-                executor.submit(
-                    self._process_search_task, task, outline, cutoff_date
-                ): task
-                for task in active_tasks
-            }
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    cands = future.result()
-                    if cands:
-                        for cand_item in cands:
-                            all_candidates_with_tasks.append(
-                                {"cand": cand_item, "task": task}
+        # Candidates are verified as soon as their search task returns, while
+        # other tasks are still discovering. Rate limiting and source fallback
+        # are handled inside utils.scholar_utils.
+        verify_futures = []
+        with ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="verify"
+        ) as verifier:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_task = {
+                    executor.submit(
+                        self._process_search_task, task, outline, cutoff_date
+                    ): task
+                    for task in active_tasks
+                }
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    try:
+                        cands = future.result() or []
+                    except Exception as exc:
+                        self._safe_print(
+                            f"      ❌ Candidate discovery failed for '{task['focus'][:20]}...': {exc}"
+                        )
+                        continue
+                    for cand_item in cands:
+                        verify_futures.append(
+                            verifier.submit(
+                                self._enrich_and_register_paper,
+                                cand_item,
+                                task,
+                                registry,
+                                cutoff_date,
                             )
-                except Exception as exc:
-                    self._safe_print(
-                        f"      ❌ Candidate discovery failed for '{task['focus'][:20]}...': {exc}"
-                    )
-
-        self._safe_print(
-            f"   📊 Phase 1b: Paper Verification & Enrichment (Semantic Scholar / OpenAlex / arXiv)..."
-        )
-        # Rate limiting and source fallback are handled inside utils.scholar_utils.
-        for item in all_candidates_with_tasks:
-            self._enrich_and_register_paper(
-                item["cand"], item["task"], registry, cutoff_date
+                        )
+            self._safe_print(
+                f"   📊 Discovery finished; waiting for {sum(not f.done() for f in verify_futures)} "
+                f"of {len(verify_futures)} candidate verifications..."
             )
+            for future in as_completed(verify_futures):
+                try:
+                    future.result()
+                except Exception as exc:  # defensive: workers handle their own errors
+                    self._safe_print(f"      ❌ Verification worker error: {exc}")
 
     def _collect_search_tasks(self, outline: Dict) -> List[Dict]:
         tasks = []
@@ -353,25 +381,74 @@ class HybridLiteratureAgent:
                 retry_count += 1
         return []
 
+    @staticmethod
+    def _cand_field(cand, name, default=None):
+        if isinstance(cand, dict):
+            return cand.get(name, default)
+        return getattr(cand, name, default)
+
+    def _reject(self, title, year, task, reason, detail=""):
+        entry = {
+            "title": title,
+            "year": year,
+            "section": task.get("section"),
+            "reason": reason,
+        }
+        if detail:
+            entry["detail"] = detail
+        with self.registry_lock:
+            self.verification_log["rejected"].append(entry)
+        self._safe_print(f"      -> 🚫 Rejected ({reason}): {title}")
+
+    def _save_verification_log(self, verified_count: int):
+        path = os.path.join(self.output_dir, "candidate_verification.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "verified_papers": verified_count,
+                    "recovery_attempts": self._recoveries_used,
+                    **self.verification_log,
+                },
+                f,
+                indent=4,
+            )
+
     def _enrich_and_register_paper(self, cand, task, registry, cutoff_date):
-        cand_title = getattr(cand, "title", None) or cand.get("title")
-        cand_year = getattr(cand, "year", None) or cand.get("year")
-        cand_reason = getattr(cand, "reason", None) or cand.get("reason", "")
+        cand_title = self._cand_field(cand, "title")
+        cand_year = self._cand_field(cand, "year")
+        cand_reason = self._cand_field(cand, "reason", "") or ""
+        if not cand_title:
+            return
 
         norm_title = self._normalize_title(cand_title)
 
+        # Skip titles already registered or being verified by another worker.
         with self.registry_lock:
-            if norm_title in registry:
+            if norm_title in registry or norm_title in self._inflight_titles:
                 return
+            self._inflight_titles.add(norm_title)
 
         try:
-            s2_data = title_search(cand_title, cand_year, cutoff_date)
+            s2_data = title_search(
+                cand_title, cand_year, cutoff_date, require_abstract=True
+            )
+            recovered = False
+            if s2_data is None:
+                s2_data, why = self._recover_candidate(
+                    cand_title, cand_year, cand_reason, task, cutoff_date
+                )
+                if s2_data is None:
+                    self._reject(cand_title, cand_year, task, why)
+                    return
+                recovered = True
 
             if s2_data:
                 if not self._is_paper_allowed(s2_data, cutoff_date):
+                    self._reject(cand_title, cand_year, task, "after_cutoff")
                     return
 
                 if not s2_data.get("abstract", ""):
+                    self._reject(cand_title, cand_year, task, "no_abstract")
                     return
 
                 authors_list = [a["name"] for a in s2_data.get("authors", [])]
@@ -408,11 +485,124 @@ class HybridLiteratureAgent:
                 with self.registry_lock:
                     if final_norm_title not in registry:
                         registry[final_norm_title] = full_obj
+                        if recovered:
+                            self.verification_log["recovered"].append(
+                                {
+                                    "candidate_title": cand_title,
+                                    "matched_title": full_obj.title,
+                                    "venue": full_obj.venue,
+                                    "year": full_obj.year,
+                                    "section": task.get("section"),
+                                }
+                            )
                         self._safe_print(
-                            f"      -> 📚 Added enriched paper: {full_obj.title}"
+                            f"      -> 📚 Added enriched paper"
+                            f"{' (recovered)' if recovered else ''}: {full_obj.title}"
+                            f" [{s2_data.get('source', '?')}]"
                         )
         except Exception as e:
-            pass
+            self._reject(cand_title, cand_year, task, "error", str(e))
+
+    def _recover_candidate(self, cand_title, cand_year, cand_reason, task, cutoff_date):
+        """LLM-assisted recovery for a candidate whose title was not found.
+
+        Fixed loop (works without tool calling, so small open models can run
+        it): the LLM proposes corrected titles / queries, the databases are
+        searched, and the LLM picks the matching real record or declares the
+        candidate non-existent. Returns (record or None, rejection reason).
+        """
+        with self.registry_lock:
+            if self._recoveries_used >= self.max_citation_recoveries:
+                return None, "not_found"
+            self._recoveries_used += 1
+
+        try:
+            query_prompt = f"""
+            A citation candidate could not be found in scholarly databases (Semantic Scholar,
+            OpenAlex, arXiv) by its title.
+
+            CANDIDATE TITLE: {cand_title}
+            CANDIDATE YEAR: {cand_year}
+            WHY IT WAS SUGGESTED: {cand_reason}
+            SEARCH TASK: {task.get('focus', '')}
+            CONTEXT: {task.get('context', '')}
+
+            The title may be slightly wrong, abbreviated, the title of a different version
+            (preprint vs. published), or the paper may not exist at all.
+            Propose up to 3 search queries to find the real paper: first your best guess of
+            its EXACT correct title (if you know it), then short keyword queries.
+            If you are confident no such paper exists, return an empty list.
+
+            Return ONLY json in a ```json``` block: {{"queries": ["...", "..."]}}
+            """
+            response = call_llm_with_contents(
+                model_name=self.fast_model_name,
+                contents=[query_prompt],
+                generation_configs={"temperature": 0.2},
+            )
+            parsed = response["parsed_response"]
+            queries = parsed.get("queries", []) if isinstance(parsed, dict) else parsed
+            queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()][:3]
+            if not queries:
+                return None, "nonexistent"
+
+            found: Dict[str, Dict] = {}
+            for i, q in enumerate(queries):
+                hit = title_search(q, cand_year, cutoff_date, require_abstract=True)
+                if hit:
+                    found.setdefault(self._normalize_title(hit["title"]), hit)
+                if i < 2:  # keyword searches may use the OpenAlex daily budget
+                    for r in keyword_search(q, limit=5, cutoff_date=cutoff_date):
+                        if r.get("abstract"):
+                            found.setdefault(self._normalize_title(r["title"]), r)
+            if not found:
+                return None, "not_found_after_recovery"
+
+            records = list(found.values())[:12]
+            listing = []
+            for i, r in enumerate(records):
+                abstract = (r.get("abstract") or "").replace("\n", " ")[:300]
+                listing.append(
+                    f"[{i}] {r['title']} ({r.get('year') or 'n.d.'}; "
+                    f"{r.get('venue') or 'unknown venue'}; "
+                    f"{r.get('citationCount') or 0} citations)\n    {abstract}"
+                )
+            select_prompt = f"""
+            We are looking for the real paper behind this citation candidate:
+            CANDIDATE TITLE: {cand_title}
+            CANDIDATE YEAR: {cand_year}
+            WHY IT WAS SUGGESTED: {cand_reason}
+
+            SEARCH RESULTS:
+            {chr(10).join(listing)}
+
+            Which search result IS this paper (the same work, possibly under a corrected or
+            published title)? Do NOT pick a merely related paper. If it is a preprint and the
+            published version is also listed, pick the published version.
+            If none of the results is the same work, use null.
+
+            Return ONLY json in a ```json``` block:
+            {{"match_index": <integer or null>, "explanation": "<one sentence>"}}
+            """
+            response = call_llm_with_contents(
+                model_name=self.fast_model_name,
+                contents=[select_prompt],
+                generation_configs={"temperature": 0.0},
+            )
+            parsed = response["parsed_response"]
+            index = parsed.get("match_index") if isinstance(parsed, dict) else None
+            if isinstance(index, str) and index.strip().isdigit():
+                index = int(index)
+            if isinstance(index, int) and 0 <= index < len(records):
+                record = records[index]
+                self._safe_print(
+                    f"      -> 🩹 Recovered '{cand_title}' as '{record['title']}'"
+                )
+                return record, ""
+            return None, "nonexistent"
+        except Exception as e:
+            self._safe_print(f"      ⚠️ Recovery failed for '{cand_title}': {e}")
+            return None, "not_found"
 
     def _is_paper_allowed(self, s2_data: Dict, cutoff_date_str: str) -> bool:
         if not cutoff_date_str:

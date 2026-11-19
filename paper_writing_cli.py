@@ -81,6 +81,13 @@ def main():
         "Gemini fast models, otherwise s2). Sources are set by PAPER_SEARCH_SOURCES.",
     )
     parser.add_argument(
+        "--max_citation_recoveries",
+        type=int,
+        default=None,
+        help="Max LLM-assisted recovery attempts for literature candidates that cannot "
+        "be found by title (0 disables). Default: PAPER_MAX_CITATION_RECOVERIES or 40.",
+    )
+    parser.add_argument(
         "--research_cutoff",
         default=None,
         help="Year-Month cutoff date for literature review (e.g., 2024-11). If not provided, defaults to current Year-Month.",
@@ -174,6 +181,12 @@ def main():
             )
             print("=" * 80 + "\n")
 
+    recovery_kwargs = (
+        {}
+        if args.max_citation_recoveries is None
+        else {"max_citation_recoveries": args.max_citation_recoveries}
+    )
+
     if args.use_plotting:
         from methods.paper_writer_with_plotting import write_single_paper
 
@@ -191,6 +204,7 @@ def main():
             plotting_max_critic_rounds=args.plotting_max_critic_rounds,
             fast_model_name=args.fast_model_name,
             lit_search_backend=args.lit_search_backend,
+            **recovery_kwargs,
         )
     else:
         from methods.paper_writer import write_single_paper
@@ -209,6 +223,7 @@ def main():
             research_cutoff=args.research_cutoff,
             fast_model_name=args.fast_model_name,
             lit_search_backend=args.lit_search_backend,
+            **recovery_kwargs,
         )
 
 

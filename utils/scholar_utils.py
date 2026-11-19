@@ -27,6 +27,14 @@ Configuration (environment / .env):
     PAPER_SEARCH_SOURCES        comma list, default "s2,openalex,arxiv"
     SEMANTIC_SCHOLAR_API_KEY    optional
     OPENALEX_API_KEY            optional (keyless: ~100 searches/day per IP)
+
+No key is required for any source. Keyless limits observed in practice:
+  * Semantic Scholar: keyless requests share one global pool that is often
+    exhausted (instant HTTP 429 on every endpoint), so it is best-effort.
+  * OpenAlex: title verification uses autocomplete + lookup by ID, which do
+    not consume the daily budget; only keyword search does ($0.001 each,
+    $0.10/day keyless per IP, $1/day with a free key).
+  * arXiv: free, one request every 3 seconds.
 """
 
 import datetime
@@ -51,6 +59,7 @@ OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY")
 S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 S2_FIELDS = "title,authors,venue,year,abstract,citationCount,journal,publicationDate,externalIds"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+OPENALEX_AUTOCOMPLETE_URL = "https://api.openalex.org/autocomplete/works"
 OPENALEX_SELECT = (
     "title,publication_year,publication_date,cited_by_count,authorships,"
     "primary_location,abstract_inverted_index,biblio,ids,type"
@@ -242,7 +251,9 @@ def _s2_search(query: str, limit: int) -> List[Dict]:
         S2_SEARCH_URL,
         {"query": query, "limit": limit, "fields": S2_FIELDS},
         headers=headers,
-        max_retries=4,
+        # The keyless pool is usually either open or exhausted for a while;
+        # retrying hard just delays the fallback sources.
+        max_retries=4 if S2_API_KEY else 2,
     )
     if rsp is None:
         return []
@@ -268,6 +279,8 @@ def _openalex_normalize(w: Dict) -> Optional[Dict]:
     loc = w.get("primary_location") or {}
     src = loc.get("source") or {}
     venue = src.get("display_name") or ""
+    if "/" in venue:  # e.g. "Conference X/Proceedings - Conference X"
+        venue = venue.split("/", 1)[0].strip()
     landing = loc.get("landing_page_url") or ""
     arxiv_match = re.search(r"arxiv\.org/abs/([^\s/?#]+?)(v\d+)?$", landing)
     arxiv_id = arxiv_match.group(1) if arxiv_match else None
@@ -302,14 +315,31 @@ def _openalex_normalize(w: Dict) -> Optional[Dict]:
     }
 
 
-def _openalex_get(params: Dict) -> List[Dict]:
-    params = dict(params, select=OPENALEX_SELECT)
+def _openalex_params(params: Dict) -> Dict:
+    params = dict(params)
     if OPENALEX_API_KEY:
         params["api_key"] = OPENALEX_API_KEY
-    rsp = _http_get("openalex", OPENALEX_WORKS_URL, params)
+    return params
+
+
+def _openalex_get(params: Dict) -> List[Dict]:
+    rsp = _http_get(
+        "openalex", OPENALEX_WORKS_URL, _openalex_params(dict(params, select=OPENALEX_SELECT))
+    )
     if rsp is None:
         return []
     return [r for r in map(_openalex_normalize, rsp.json().get("results") or []) if r]
+
+
+def _openalex_get_work(work_id: str) -> Optional[Dict]:
+    """Single-work lookup by OpenAlex ID (free: does not use the daily budget)."""
+    work_id = work_id.rsplit("/", 1)[-1]
+    rsp = _http_get(
+        "openalex",
+        f"{OPENALEX_WORKS_URL}/{work_id}",
+        _openalex_params({"select": OPENALEX_SELECT}),
+    )
+    return _openalex_normalize(rsp.json()) if rsp is not None else None
 
 
 def _openalex_search(query: str, limit: int) -> List[Dict]:
@@ -322,9 +352,25 @@ def _openalex_search(query: str, limit: int) -> List[Dict]:
 
 
 def _openalex_title_search(title: str, limit: int) -> List[Dict]:
-    # Commas/colons/pipes are filter syntax in OpenAlex.
-    clean = re.sub(r"[,:|]", " ", title)
-    return _openalex_get({"filter": f"title.search:{clean}", "per_page": limit})
+    """Title lookup via autocomplete + per-work fetch; neither uses the budget."""
+    rsp = _http_get("openalex", OPENALEX_AUTOCOMPLETE_URL, _openalex_params({"q": title}))
+    if rsp is None:
+        return []
+    hits = [
+        h
+        for h in rsp.json().get("results") or []
+        if h.get("id")
+        and fuzz.ratio(title.lower(), (h.get("display_name") or "").lower())
+        > TITLE_MATCH_THRESHOLD
+    ]
+    # Most-cited first: usually the published version rather than a preprint.
+    hits.sort(key=lambda h: h.get("cited_by_count") or 0, reverse=True)
+    records = []
+    for h in hits[: min(limit, 3)]:
+        record = _openalex_get_work(h["id"])
+        if record:
+            records.append(record)
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -463,31 +509,68 @@ def keyword_search(query: str, limit: int = 20, cutoff_date: str = None) -> List
     return _run_chain(_KEYWORD_SEARCH, query, limit, accept) or []
 
 
-def _best_title_match(results: List[Dict], title: str, year_hint, cutoff_date) -> Optional[Dict]:
-    best, best_ratio = None, 0
+def is_preprint(record: Dict) -> bool:
+    return not record.get("journal") and (record.get("venue") or "").lower().startswith(
+        "arxiv"
+    )
+
+
+def _best_title_match(
+    results: List[Dict],
+    title: str,
+    year_hint,
+    cutoff_date,
+    require_abstract: bool = False,
+) -> Optional[Dict]:
+    scored = []
     for r in results:
         if not is_date_valid(r.get("publicationDate"), r.get("year"), cutoff_date):
+            continue
+        if require_abstract and not r.get("abstract"):
             continue
         ratio = fuzz.ratio(title.lower(), r["title"].lower())
         if year_hint and r.get("year") == year_hint:
             ratio += 10
-        if ratio > best_ratio:
-            best, best_ratio = r, ratio
-    return best if best_ratio > TITLE_MATCH_THRESHOLD else None
+        if ratio > TITLE_MATCH_THRESHOLD:
+            scored.append((ratio, r))
+    if not scored:
+        return None
+    best_ratio = max(ratio for ratio, _ in scored)
+    # Among (near-)equal title matches, prefer the published version of a paper
+    # over its preprint, then the most-cited record.
+    close = [r for ratio, r in scored if ratio >= best_ratio - 5]
+    close.sort(key=lambda r: (not is_preprint(r), r.get("citationCount") or 0), reverse=True)
+    return close[0]
 
 
-def title_search(title: str, year_hint: int = None, cutoff_date: str = None) -> Optional[Dict]:
-    """Finds the record for a specific paper title, verifying it exists."""
+def title_search(
+    title: str,
+    year_hint: int = None,
+    cutoff_date: str = None,
+    require_abstract: bool = False,
+) -> Optional[Dict]:
+    """Finds the record for a specific paper title, verifying it exists.
+
+    With require_abstract=True, sources are tried until a matching record that
+    has an abstract is found (OpenAlex lacks abstracts for many publishers).
+    """
     if not title:
         return None
     cached = _cache_get(title)
-    if cached and is_date_valid(cached.get("publicationDate"), cached.get("year"), cutoff_date):
+    if (
+        cached
+        and is_date_valid(cached.get("publicationDate"), cached.get("year"), cutoff_date)
+        and (cached.get("abstract") or not require_abstract)
+        and not is_preprint(cached)
+    ):
         return cached
     return _run_chain(
         _TITLE_SEARCH,
         title,
         5,
-        lambda results: _best_title_match(results, title, year_hint, cutoff_date),
+        lambda results: _best_title_match(
+            results, title, year_hint, cutoff_date, require_abstract
+        ),
     )
 
 
