@@ -69,6 +69,10 @@ ARXIV_API_URL = "https://export.arxiv.org/api/query"
 DEFAULT_SOURCES = ("s2", "openalex", "arxiv")
 # Seconds a source is skipped after it exhausted its retries.
 SOURCE_COOLDOWN = float(os.environ.get("PAPER_SEARCH_COOLDOWN", "300"))
+# Max seconds a lookup waits when every source is rate-limited at once.
+SEARCH_MAX_WAIT = float(os.environ.get("PAPER_SEARCH_MAX_WAIT", "360"))
+# Cooldown after timeouts/connection errors (servers that are just slow).
+NETWORK_ERROR_COOLDOWN = float(os.environ.get("PAPER_SEARCH_NETWORK_COOLDOWN", "60"))
 # Fuzzy title-match threshold (0-100) for verification.
 TITLE_MATCH_THRESHOLD = 70
 
@@ -194,6 +198,7 @@ def _http_get(
             rsp = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
         except requests.RequestException as e:
             last = f"{type(e).__name__}"
+            retry_after = NETWORK_ERROR_COOLDOWN
         else:
             if rsp.status_code == 200:
                 return rsp
@@ -483,23 +488,51 @@ def get_sources() -> List[str]:
     return sources
 
 
+def _cooldown_remaining(sources: List[str]) -> Optional[float]:
+    """Seconds until the first of `sources` leaves cooldown (None if any is free)."""
+    now = time.monotonic()
+    with _cooldown_lock:
+        waits = [_cooldown_until.get(s, 0.0) - now for s in sources]
+    if any(w <= 0 for w in waits):
+        return None
+    return min(waits)
+
+
 def _run_chain(registry, query: str, limit: int, accept: Callable[[List[Dict]], Optional[object]]):
-    for source in get_sources():
-        if _in_cooldown(source):
-            continue
-        try:
-            results = registry[source](query, limit)
-        except SourceUnavailable as e:
-            _start_cooldown(source, str(e), e.retry_after)
-            continue
-        except Exception as e:  # parsing errors etc.: try next source
-            print(f"      ⚠️ Paper source '{source}' error for '{query[:60]}': {e}")
-            continue
-        _cache_put(results)
-        accepted = accept(results)
-        if accepted:
-            return accepted
-    return None
+    """Tries sources in order. If no source could answer at all (all rate
+    limited / down), waits for the first one to come back, up to
+    PAPER_SEARCH_MAX_WAIT seconds, instead of treating it as 'no results'."""
+    sources = get_sources()
+    deadline = time.monotonic() + SEARCH_MAX_WAIT
+    while True:
+        answered = False
+        for source in sources:
+            if _in_cooldown(source):
+                continue
+            try:
+                results = registry[source](query, limit)
+            except SourceUnavailable as e:
+                _start_cooldown(source, str(e), e.retry_after)
+                continue
+            except Exception as e:  # parsing errors etc.: try next source
+                print(f"      ⚠️ Paper source '{source}' error for '{query[:60]}': {e}")
+                continue
+            answered = True
+            _cache_put(results)
+            accepted = accept(results)
+            if accepted:
+                return accepted
+        if answered:
+            return None
+        wait = _cooldown_remaining(sources)
+        if wait is None:
+            continue  # a source left cooldown meanwhile; try again
+        if time.monotonic() + wait > deadline:
+            print(
+                f"      ⚠️ All paper sources unavailable; giving up on '{query[:60]}'."
+            )
+            return None
+        time.sleep(wait + 0.1)
 
 
 def keyword_search(query: str, limit: int = 20, cutoff_date: str = None) -> List[Dict]:

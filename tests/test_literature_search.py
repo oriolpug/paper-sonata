@@ -61,6 +61,7 @@ def fast_and_clean(monkeypatch):
     monkeypatch.setattr(su.time, "sleep", lambda s: None)
     for lim in su._limiters.values():
         monkeypatch.setattr(lim, "min_interval", 0.0)
+        monkeypatch.setattr(lim, "_next_time", 0.0)
     monkeypatch.delenv("PAPER_SEARCH_SOURCES", raising=False)
     su._paper_cache.clear()
     su._cooldown_until.clear()
@@ -257,3 +258,42 @@ def test_preprint_bibtex(monkeypatch, tmp_path):
     bib = agent._generate_bibtex(list(registry.values()))
     assert bib.startswith("@article{")
     assert "journal={arXiv preprint arXiv:1706.03762}" in bib
+
+
+def test_waits_when_all_sources_cooling_down(monkeypatch):
+    """When every source is rate-limited, wait for the first to recover
+    instead of reporting 'no results'."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(su.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(su.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setenv("PAPER_SEARCH_SOURCES", "s2,arxiv")
+    su._cooldown_until.update({"s2": 1300.0, "arxiv": 1020.0})
+    calls = route(monkeypatch, {"arxiv": lambda p: _Rsp(200, content=ARXIV_XML)})
+    hit = su.title_search("Deep Residual Learning for Image Recognition", 2016, "2024-10")
+    assert hit["source"] == "arxiv"
+    assert 1020.0 <= clock["t"] < 1030.0  # waited ~20s for arXiv, not 300s for S2
+    assert [k for k, _ in calls] == ["arxiv"]
+
+
+def test_gives_up_after_max_wait(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(su.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(su.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(su, "SEARCH_MAX_WAIT", 60.0)
+    monkeypatch.setenv("PAPER_SEARCH_SOURCES", "s2")
+    su._cooldown_until.update({"s2": 1300.0})
+    route(monkeypatch, {})
+    assert su.keyword_search("anything") == []
+    assert clock["t"] == 1000.0  # did not sleep past the budget
+
+
+def test_timeout_uses_short_cooldown(monkeypatch):
+    def boom(*a, **k):
+        raise su.requests.ReadTimeout("slow")
+
+    monkeypatch.setattr(su.requests, "get", boom)
+    monkeypatch.setenv("PAPER_SEARCH_SOURCES", "arxiv")
+    monkeypatch.setattr(su, "SEARCH_MAX_WAIT", 0.0)
+    assert su.keyword_search("residual networks") == []
+    remaining = su._cooldown_until["arxiv"] - su.time.monotonic()
+    assert 0 < remaining <= su.NETWORK_ERROR_COOLDOWN
