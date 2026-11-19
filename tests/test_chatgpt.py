@@ -375,3 +375,46 @@ def test_image_generation_unavailable_on_plan(monkeypatch):
     from utils import image_gen
     monkeypatch.setattr(image_gen.litellm, "image_generation", lambda **k: pytest.fail("no"))
     assert image_gen.generate_image("chatgpt/gpt-6-luna", "diagram") is None
+
+
+def test_login_retries_once_after_invalid_grant(rsa_key, monkeypatch):
+    authorize_urls = []
+    nonces = []
+
+    def fake_browser(url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        authorize_urls.append(q)
+        nonces.append(q["nonce"])
+        params = {"code": f"code{len(authorize_urls)}", "state": q["state"]}
+        if q["client_id"] == "dynamic_agent_client":
+            params["client_id"] = "oaiapp_1"
+        redirect = q["redirect_uri"] + "?" + urllib.parse.urlencode(params)
+        threading.Thread(target=lambda: urllib.request.urlopen(redirect, timeout=5).read(), daemon=True).start()
+        return True
+
+    def fake_post(url, data=None, timeout=None):
+        if data["code"] == "code1":
+            return SimpleNamespace(status_code=400, json=lambda: {
+                "error": "invalid_grant", "error_description": "code not valid for client"})
+        return SimpleNamespace(status_code=200, json=lambda: {
+            "access_token": "at", "refresh_token": "rt", "expires_in": 3600,
+            "id_token": make_id_token(rsa_key, nonce=nonces[-1]),
+            "scope": "openid email offline_access resource.invoke chatgpt.tokens.use.direct"})
+
+    monkeypatch.setattr(auth, "DEFAULT_PORT", 0)
+    monkeypatch.setattr(auth.webbrowser, "open", fake_browser)
+    monkeypatch.setattr(auth.requests, "post", fake_post)
+    monkeypatch.setattr(auth, "_jwks_client", lambda: FakeJWKS(rsa_key))
+    monkeypatch.setattr(auth.sys.stdin, "isatty", lambda: False)
+
+    session = auth.login(timeout=10)
+    assert session["access_token"] == "at"
+    assert [q["client_id"] for q in authorize_urls] == ["dynamic_agent_client", "oaiapp_1"]
+    assert "agent_name_hint" not in authorize_urls[1]
+
+
+def test_invalid_grant_twice_reports_description(monkeypatch):
+    monkeypatch.setattr(auth.requests, "post", lambda *a, **k: SimpleNamespace(
+        status_code=400, json=lambda: {"error": "invalid_grant", "error_description": "bad code"}))
+    with pytest.raises(auth.ChatGPTAuthError, match="invalid_grant .*bad code"):
+        auth.exchange_code("c", "oaiapp_1", "v", "http://127.0.0.1:1455/auth/callback")

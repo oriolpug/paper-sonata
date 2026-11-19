@@ -313,18 +313,27 @@ def _token_request(data: Dict[str, str]) -> Dict[str, Any]:
     except ValueError:
         body = {"error": f"http_{rsp.status_code}"}
     if rsp.status_code != 200:
-        error = body.get("error") if isinstance(body, dict) else None
+        body = body if isinstance(body, dict) else {}
+        error = body.get("error")
+        description = body.get("error_description") or ""
         if isinstance(error, dict):
+            description = description or error.get("message") or ""
             error = error.get("code") or error.get("type")
-        raise _TokenEndpointError(str(error or f"http_{rsp.status_code}"), rsp.status_code)
+        raise _TokenEndpointError(
+            str(error or f"http_{rsp.status_code}"), rsp.status_code, str(description)
+        )
     return body
 
 
 class _TokenEndpointError(ChatGPTAuthError):
-    def __init__(self, code: str, status: int):
-        super().__init__(f"token endpoint error: {code} (HTTP {status})")
+    def __init__(self, code: str, status: int, description: str = ""):
+        message = f"token endpoint error: {code} (HTTP {status})"
+        if description:
+            message += f": {description}"
+        super().__init__(message)
         self.code = code
         self.status = status
+        self.description = description
 
 
 def exchange_code(code: str, client_id: str, verifier: str, redirect_uri: str) -> Dict[str, Any]:
@@ -415,7 +424,12 @@ def _show_plan_notice(host: Dict[str, Any]):
     save_host(host)
 
 
-def login(open_browser: bool = True, timeout: float = 300.0, prompt: Optional[str] = None) -> Dict[str, Any]:
+def login(
+    open_browser: bool = True,
+    timeout: float = 300.0,
+    prompt: Optional[str] = None,
+    _retried: bool = False,
+) -> Dict[str, Any]:
     """Runs the browser sign-in ("Continue with ChatGPT") and stores the session."""
     host = load_host()
     previous = load_session()
@@ -448,7 +462,16 @@ def login(open_browser: bool = True, timeout: float = 300.0, prompt: Optional[st
         host["client_id"] = client_id
         save_host(host)
 
-    tokens = exchange_code(code, client_id, verifier, redirect_uri)
+    try:
+        tokens = exchange_code(code, client_id, verifier, redirect_uri)
+    except _TokenEndpointError as e:
+        if e.code != "invalid_grant" or _retried:
+            raise
+        # Documented recovery: discard the code and start a fresh
+        # authorization with the retained issued client ID. This is expected
+        # right after first-time registration.
+        print("Finishing sign-in with the newly registered app; your browser will open again.")
+        return login(open_browser=open_browser, timeout=timeout, prompt=prompt, _retried=True)
     claims = validate_id_token(tokens["id_token"], client_id, nonce)
     session = _session_from_tokens(tokens, client_id, host["ext_agent_host_id"], claims)
     save_session(session)
