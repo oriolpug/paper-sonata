@@ -104,8 +104,9 @@ class _RateLimiter:
 
 
 _limiters = {
-    # S2: ~1 req/s with a key; the keyless pool is shared, so be gentle.
-    "s2": _RateLimiter(float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL", "1.0"))),
+    # S2: introductory keys allow 1 req/s; at exactly 1.0-1.1s spacing about
+    # 1 in 4 requests is still refused (observed), so keep some slack.
+    "s2": _RateLimiter(float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL", "1.25"))),
     # OpenAlex search endpoints refuse bursts; space them out.
     "openalex": _RateLimiter(float(os.environ.get("OPENALEX_MIN_INTERVAL", "0.5"))),
     # arXiv API terms: no more than one request every 3 seconds.
@@ -167,6 +168,11 @@ def _retry_after_seconds(rsp: requests.Response) -> Optional[float]:
         return None
 
 
+# First retry delay per source (doubles each attempt). Keyed Semantic Scholar
+# 429s are per-second limits, so a short wait suffices.
+_BACKOFF_BASE = {"s2": 1.5 if S2_API_KEY else 2.0, "openalex": 2.0, "arxiv": 3.0}
+
+
 def _http_get(
     source: str,
     url: str,
@@ -203,7 +209,7 @@ def _http_get(
                 time.sleep(retry_after)
                 continue
         if attempt + 1 < max_retries:
-            time.sleep(min(2 ** (attempt + 1), 20))
+            time.sleep(min(_BACKOFF_BASE.get(source, 2.0) * 2**attempt, 20))
     raise SourceUnavailable(last, retry_after)
 
 

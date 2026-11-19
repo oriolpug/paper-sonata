@@ -33,6 +33,7 @@ def clean_env(monkeypatch):
         "PAPER_REFLECTION_MODEL",
         "PAPER_PLOTTING_MODEL",
         "PAPER_MAX_OUTPUT_TOKENS",
+        "PAPER_OLLAMA_THINK",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -238,6 +239,17 @@ def test_ollama_gets_num_ctx(fake):
     f = fake("plain text")
     call_llm_with_contents(["hi"], "ollama_chat/qwen3:8b", return_json=False)
     assert f.calls[0]["num_ctx"] == 32768
+    assert f.calls[0]["think"] is False
+
+
+def test_ollama_think_opt_in(fake, monkeypatch):
+    monkeypatch.setenv("PAPER_OLLAMA_THINK", "true")
+    f = fake("plain text")
+    call_llm_with_contents(["hi"], "ollama_chat/qwen3:8b", return_json=False)
+    assert f.calls[0]["think"] is True
+    f2 = fake("plain")
+    call_llm_with_contents(["hi"], "ollama_chat/gpt-oss:20b", return_json=False)
+    assert "think" not in f2.calls[0]
 
 
 def test_tools_passed_through(fake):

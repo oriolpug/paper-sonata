@@ -316,6 +316,12 @@ def _completion_kwargs(model_name: str) -> Dict[str, Any]:
         # Ollama's default context window is small and silently truncates the
         # long prompts this pipeline sends.
         kwargs["num_ctx"] = int(os.getenv("PAPER_OLLAMA_NUM_CTX", "32768"))
+        # Reasoning models (Qwen3, DeepSeek-R1, ...) "think" by default, which
+        # is ~30x slower on local hardware. Off unless PAPER_OLLAMA_THINK=true.
+        # gpt-oss only accepts effort levels, so leave it alone.
+        think = _env_flag("PAPER_OLLAMA_THINK")
+        if not model_name.split("/", 1)[-1].startswith("gpt-oss"):
+            kwargs["think"] = bool(think)
     max_tokens = os.getenv("PAPER_MAX_OUTPUT_TOKENS")
     if max_tokens:
         kwargs["max_tokens"] = int(max_tokens)
