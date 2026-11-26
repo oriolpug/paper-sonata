@@ -35,7 +35,11 @@ from typing import Dict, List, Optional
 
 from methods.prompts.section_writing_agent import section_writing_agent_prompt
 from utils.llm_backend_utils import call_llm_with_images
-from utils.latex_cleanup import clean_generated_latex
+from utils.latex_cleanup import (
+    clean_generated_latex,
+    ensure_figures_included,
+    find_copied_examples,
+)
 from utils.llm_parsing import make_document_parser
 from utils.model_defaults import DEFAULT_WRITER_MODEL
 from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
@@ -207,12 +211,17 @@ class SectionWritingAgent:
                 "temperature": 0.7,
             },
             model_name=self.model_name,
-            result_parsing_func=make_document_parser(template_content),
+            result_parsing_func=make_document_parser(
+                template_content,
+                validate=lambda doc: find_copied_examples(doc, guidelines_content, template_content),
+            ),
             check_parsed_response_not_none=True,
         )
         cleaned_latex, fixes = clean_generated_latex(
             response_dict["parsed_response"], citation_map.keys()
         )
+        cleaned_latex, figure_fixes = ensure_figures_included(cleaned_latex, figures_info)
+        fixes += figure_fixes
         for fix in fixes:
             print(f" > 🔧 {fix}")
 
@@ -258,4 +267,6 @@ Here are the input materials for the paper.
 4. Insert figures using the filenames from the 'figures_list' input.
 5. Use citations from the Reference Library.
 6. Return the **full** compilable LaTeX file.
+7. Tables must report the actual numbers from `experimental_log.md`. The example tables in
+   `conference_guidelines.md` only illustrate formatting: never copy their contents.
 """

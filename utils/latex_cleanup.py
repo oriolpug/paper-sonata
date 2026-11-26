@@ -74,3 +74,90 @@ def strip_manual_section_numbers(latex: str) -> str:
 def clean_generated_latex(latex: str, valid_keys: Iterable[str]) -> Tuple[str, List[str]]:
     latex = strip_manual_section_numbers(latex)
     return fix_citation_keys(latex, valid_keys)
+
+
+_LATEX_SPECIAL = re.compile(r"(?<!\\)([&%#_$])")
+
+
+def _escape_caption(text: str) -> str:
+    return _LATEX_SPECIAL.sub(r"\\\1", text or "")
+
+
+def ensure_figures_included(
+    latex: str, figures: List[Dict], figures_dir: str = "figures"
+) -> Tuple[str, List[str]]:
+    """Inserts a figure environment for every provided figure the draft never
+    includes, before the Conclusion section (or \\end{document}).
+
+    `figures` items have "name" (file name) and optional "caption".
+    """
+    included = set(re.findall(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}", latex))
+    included_names = {path.rsplit("/", 1)[-1] for path in included}
+    blocks, changes = [], []
+    for fig in figures or []:
+        name = (fig.get("name") or "").strip()
+        if not name or name in included_names or name.rsplit(".", 1)[0] in included_names:
+            continue
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", name.rsplit(".", 1)[0]).strip("_")
+        blocks.append(
+            "\\begin{figure}[t]\n"
+            "  \\centering\n"
+            f"  \\includegraphics[width=\\linewidth]{{{figures_dir}/{name}}}\n"
+            f"  \\caption{{{_escape_caption(fig.get('caption', ''))}}}\n"
+            f"  \\label{{fig:{stem}}}\n"
+            "\\end{figure}\n\n"
+        )
+        changes.append(f"inserted missing figure '{name}'")
+    if not blocks:
+        return latex, changes
+
+    anchor = re.search(r"\\section\*?\{\s*(?:\d+\.?\s*)?Conclusions?\s*\}", latex, re.IGNORECASE)
+    if not anchor:
+        anchor = re.search(r"\\end\{document\}", latex)
+    pos = anchor.start() if anchor else len(latex)
+    return latex[:pos] + "".join(blocks) + latex[pos:], changes
+
+
+# Table cells too generic to signal copied example content.
+_GENERIC_CELLS = {"method", "methods", "ours", "model", "models", "setting", "results", "part", "description"}
+
+
+def example_phrases(guidelines: str, template: str = "") -> Tuple[List[str], List[str]]:
+    """Content that must never appear in a finished paper.
+
+    Returns (example_cells, placeholders): text of the example tables in the
+    conference guidelines (e.g. "Frobnability"), and the template's
+    placeholder lines (e.g. "Methodology here.").
+    """
+    cells = set()
+    for block in re.findall(r"\\begin\{tabular\}.*?\\end\{tabular\}", guidelines or "", re.S):
+        body = re.sub(r"\\begin\{tabular\}\{(?:[^{}]|\{[^{}]*\})*\}|\\end\{tabular\}", " ", block)
+        body = re.sub(r"\\multicolumn\{[^}]*\}\{[^}]*\}", " ", body)
+        for row in re.split(r"\\\\", body):
+            for cell in row.split("&"):
+                text = re.sub(r"\\(?:bf|it|em|textbf|textit|emph|hline|toprule|midrule|bottomrule)\b|[{}]", " ", cell)
+                text = " ".join(text.split())
+                if (
+                    len(text) >= 4
+                    and not re.fullmatch(r"[\d.\s%±+\-]+", text)
+                    and text.lower() not in _GENERIC_CELLS
+                ):
+                    cells.add(text)
+    placeholders = sorted(
+        {line.strip() for line in (template or "").splitlines() if re.fullmatch(r"[A-Z][\w ,]* here\.", line.strip())}
+    )
+    return sorted(cells), placeholders
+
+
+def find_copied_examples(latex: str, guidelines: str, template: str = "") -> List[str]:
+    """Problems if the draft copied guideline example tables (two or more
+    example cells) or left template placeholders in place."""
+    cells, placeholders = example_phrases(guidelines, template)
+    problems = []
+    copied = [c for c in cells if c in latex]
+    if len(copied) >= 2:
+        problems.append(f"copied example table content from the guidelines: {copied[:4]}")
+    left = [p for p in placeholders if p in latex]
+    if left:
+        problems.append(f"template placeholders left: {left}")
+    return problems

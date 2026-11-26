@@ -193,18 +193,26 @@ def splice_marked_blocks(template: str, fragment: str):
     return "".join(result)
 
 
-def make_document_parser(template: str):
+def make_document_parser(template: str, validate=None):
     """Parser for writing steps: accepts a full LaTeX document, or sections
-    that can be spliced into `template`; otherwise returns None (retry)."""
+    that can be spliced into `template`; otherwise returns None (retry).
+
+    `validate(document)` may return a list of problems; a non-empty list
+    rejects the answer too (so it is retried).
+    """
 
     def parse(response: str):
         document = parse_latex_document(response)
-        if document is not None:
-            return document
-        if not template:
+        if document is None and template:
+            fragment = parse_latex(response)
+            document = splice_sections(template, fragment) or splice_marked_blocks(template, fragment)
+        if document is None:
             return None
-        fragment = parse_latex(response)
-        return splice_sections(template, fragment) or splice_marked_blocks(template, fragment)
+        problems = validate(document) if validate else []
+        if problems:
+            print(f" >> Rejected LaTeX answer: {'; '.join(problems)}")
+            return None
+        return document
 
     return parse
 
