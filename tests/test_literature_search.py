@@ -206,34 +206,94 @@ def _agent(tmp_path, **kw):
     )
 
 
-def test_db_discovery_flow(monkeypatch, tmp_path):
+def _fake_llm(outputs, prompts):
+    def call(model_name, contents, generation_configs=None, **kwargs):
+        prompts.append((model_name, contents[0]))
+        out = outputs.pop(0)
+        return {"raw_response": json.dumps(out), "parsed_response": out}
+    return call
+
+
+def test_db_discovery_flow_scores_relevance(monkeypatch, tmp_path):
     from methods.agents import literature_review_agent as lra
 
-    paper = su._s2_normalize(RESNET_S2)
-    monkeypatch.setattr(lra, "keyword_search", lambda q, limit, cutoff_date: [paper])
-    llm_outputs = [
-        {"queries": ["residual networks", "deep residual learning"]},
-        {"section_name": "Intro", "candidates": [
-            {"title": paper["title"], "year": 2016, "reason": "backbone"}]},
-    ]
+    resnet = su._s2_normalize(RESNET_S2)
+    offtopic = dict(su._s2_normalize(RESNET_S2), title="The Year in Cardiovascular Medicine",
+                    citationCount=5000)
+    known = dict(su._s2_normalize(RESNET_S2), title="Identity Mappings in Deep Residual Networks")
+    searched = []
+    monkeypatch.setattr(lra, "keyword_search",
+                        lambda q, limit, cutoff_date: searched.append(q) or [resnet, offtopic])
+    monkeypatch.setattr(lra, "title_search", lambda t, y, c, **kw: known if "Identity" in t else None)
+    monkeypatch.setattr(lra, "title_candidates", lambda *a, **k: [])
     prompts = []
-
-    def fake_call(model_name, contents, generation_configs=None, **kwargs):
-        prompts.append((model_name, contents[0]))
-        out = llm_outputs.pop(0)
-        return {"raw_response": json.dumps(out), "parsed_response": out}
-
-    monkeypatch.setattr(lra, "call_llm_with_contents", fake_call)
+    monkeypatch.setattr(lra, "call_llm_with_contents", _fake_llm([
+        {"queries": ["Find highly cited papers on residual networks", "deep residual learning"],
+         "known_titles": ["Identity Mappings in Deep Residual Networks"]},
+        {"scores": [{"index": 0, "score": 3, "reason": "core"},
+                    {"index": 1, "score": 3, "reason": "backbone"},
+                    {"index": 2, "score": 0, "reason": "other field"}]},
+    ], prompts))
     agent = _agent(tmp_path, model_name="ollama_chat/qwen3:8b", fast_model_name="ollama_chat/qwen3:8b")
-    assert agent.search_backend == "s2"
+    (tmp_path / "a").write_text("We study image classification with very deep networks.")
+    agent.context_files = agent._load_context_files()
     cands = agent._discover_candidates(
         {"section": "Intro", "focus": "residual nets", "context": "c", "search_type": "exploration"},
-        {"intro_related_work_plan": {}},
+        {"intro_related_work_plan": {"introduction_strategy": {"problem_gap_hypothesis": "deep nets degrade"}}},
         "2024-10",
     )
-    assert cands[0]["title"] == paper["title"]
+    titles = [c["title"] for c in cands]
+    assert "The Year in Cardiovascular Medicine" not in titles  # scored 0
+    assert set(titles) == {known["title"], resnet["title"]}
+    assert searched == ["residual networks", "deep residual learning"]  # filler stripped
+    assert "image classification with very deep networks" in prompts[0][1]  # project brief
+    assert "[2] The Year in Cardiovascular Medicine" in prompts[1][1]
     assert all(m == "ollama_chat/qwen3:8b" for m, _ in prompts)
-    assert paper["title"] in prompts[1][1]
+
+
+def test_targeted_uses_quoted_name_and_keeps_one(monkeypatch, tmp_path):
+    from methods.agents import literature_review_agent as lra
+
+    sam = dict(su._s2_normalize(RESNET_S2), title="Segment Anything")
+    other = dict(su._s2_normalize(RESNET_S2), title="SAM 2: Segment Anything in Images and Videos")
+    searched, looked_up = [], []
+    monkeypatch.setattr(lra, "keyword_search",
+                        lambda q, limit, cutoff_date: searched.append(q) or [other])
+    # The original paper is only found by the most-cited title lookup.
+    monkeypatch.setattr(lra, "title_candidates",
+                        lambda q, limit, cutoff_date: looked_up.append(q) or [sam])
+    monkeypatch.setattr(lra, "title_search", lambda *a, **k: None)
+    monkeypatch.setattr(lra, "call_llm_with_contents", _fake_llm([
+        {"queries": ["segment anything promptable segmentation"], "known_titles": []},
+        {"scores": [{"index": 0, "score": 3}, {"index": 1, "score": 0}]},
+    ], []))
+    agent = _agent(tmp_path, fast_model_name="ollama_chat/qwen3:8b")
+    cands = agent._discover_candidates(
+        {"section": "RW", "focus": "research paper introducing 'Segment Anything Model (SAM)'",
+         "context": "c", "search_type": "targeted"},
+        {}, "2024-10",
+    )
+    assert searched[0] == "Segment Anything Model SAM"
+    assert looked_up[0] == "Segment Anything Model SAM"
+    assert [c["title"] for c in cands] == ["Segment Anything"]
+
+
+def test_clean_search_query():
+    from methods.agents.literature_review_agent import clean_search_query as c
+
+    assert c("Find highly cited papers establishing the real-world impact of temporal "
+             "inconsistency in video segmentation") == "temporal inconsistency video segmentation"
+    assert c("Identify foundational papers establishing causal video segmentation") == "causal video segmentation"
+    assert len(c("a b c d e f g h i j k l m n o p").split()) <= 8
+
+
+def test_parse_relevance_scores():
+    from methods.agents.literature_review_agent import parse_relevance_scores as p
+
+    assert p({"scores": [{"index": "[1]", "score": "2", "reason": "x"}, {"oops": 1}]}) == [
+        {"index": 1, "score": 2.0, "reason": "x"}]
+    assert [i["index"] for i in p({"0": 3, "1": 0})] == [0, 1]
+    assert p("garbage") == []
 
 
 def test_google_backend_falls_back_for_non_gemini(tmp_path):
@@ -297,3 +357,11 @@ def test_timeout_uses_short_cooldown(monkeypatch):
     assert su.keyword_search("residual networks") == []
     remaining = su._cooldown_until["arxiv"] - su.time.monotonic()
     assert 0 < remaining <= su.NETWORK_ERROR_COOLDOWN
+
+
+def test_title_lookup_variants():
+    from methods.agents.literature_review_agent import title_lookup_variants as v
+
+    assert v(["segment anything model", "Ref-AVS dataset"]) == [
+        "segment anything model", "segment anything", "Ref-AVS dataset", "Ref-AVS"]
+    assert v(["model"]) == ["model"]

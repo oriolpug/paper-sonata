@@ -28,11 +28,75 @@ from utils.llm import is_gemini_model, web_search_tools
 from utils.llm_backend_utils import call_llm_with_contents
 from utils.llm_parsing import parse_latex
 from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
-from utils.scholar_utils import keyword_search, title_search
+from utils.scholar_utils import keyword_search, title_candidates, title_search
 
 SEARCH_BACKENDS = ("auto", "google", "s2")
 # LLM-assisted recovery attempts per run for candidates not found by title.
 DEFAULT_MAX_CITATION_RECOVERIES = int(os.getenv("PAPER_MAX_CITATION_RECOVERIES", "40"))
+
+
+# Minimum LLM relevance score (0-3) for exploration results to be kept.
+MIN_RELEVANCE_SCORE = int(os.getenv("PAPER_MIN_RELEVANCE_SCORE", "2"))
+
+_QUERY_FILLER = re.compile(
+    r"\b(find|identify|search(?: for)?|look for|locate|highly[- ]cited|influential|"
+    r"seminal|foundational|landmark|key|recent|published|research|papers?|works?|"
+    r"studies|articles?|establishing|demonstrating|showing|introducing|on the|"
+    r"real[- ]world impact of|impact of|technical report|original|the|of|for|in|on|"
+    r"and|a|an|that|which|about)\b",
+    re.IGNORECASE,
+)
+
+
+def clean_search_query(query: str, max_words: int = 8) -> str:
+    """Strips instruction/filler words that make keyword search drift and caps
+    the length (long queries match loosely in full-text search engines)."""
+    text = re.sub(r"[\"'‘’“”()\[\]{}]", " ", query or "")
+    text = _QUERY_FILLER.sub(" ", text)
+    words = [w for w in re.split(r"\s+", text) if w and w not in {"-", ":", ","}]
+    return " ".join(words[:max_words]).strip(" ,.:;-")
+
+
+_GENERIC_NAME_WORDS = {
+    "model", "models", "dataset", "datasets", "benchmark", "metric", "metrics",
+    "optimizer", "method", "methods", "framework", "network", "networks", "module",
+    "modules", "variant", "version", "architecture", "algorithm", "approach",
+}
+
+
+def title_lookup_variants(queries: List[str]) -> List[str]:
+    """Title-lookup strings for an original paper: each query plus a variant
+    without generic words, since title matching requires every word
+    ("segment anything model" misses the paper titled "Segment Anything")."""
+    variants = []
+    for q in queries:
+        variants.append(q)
+        core = " ".join(w for w in q.split() if w.lower() not in _GENERIC_NAME_WORDS)
+        if core and len(core.split()) >= 1 and core.lower() != q.lower():
+            variants.append(core)
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def parse_relevance_scores(parsed) -> List[Dict]:
+    """Normalizes the LLM's relevance output to [{"index", "score", "reason"}].
+
+    Accepts {"scores": [...]}, a bare list, or {"0": 3, "1": 0} mappings.
+    """
+    if isinstance(parsed, dict) and "scores" in parsed:
+        parsed = parsed["scores"]
+    items = []
+    if isinstance(parsed, dict):
+        parsed = [{"index": k, "score": v} for k, v in parsed.items()]
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(str(item.get("index")).strip("[] "))
+            score = float(item.get("score"))
+        except (TypeError, ValueError):
+            continue
+        items.append({"index": index, "score": score, "reason": str(item.get("reason") or "")})
+    return items
 
 
 class CandidatePaper(BaseModel):
@@ -701,115 +765,211 @@ class HybridLiteratureAgent:
             return response_dict["parsed_response"].get("candidates", [])
         return []
 
-    def _discover_candidates_s2(self, task, outline, cutoff_date) -> list:
-        """Model-agnostic discovery: LLM writes queries, scholarly databases
-        (Semantic Scholar -> OpenAlex -> arXiv) are searched, and the LLM
-        selects relevant papers from the real search results."""
+    def _project_brief(self, outline) -> str:
+        """Short description of the project used to anchor queries and relevance."""
         intro_plan = outline.get("intro_related_work_plan", {}).get(
             "introduction_strategy", {}
         )
-        core_problem = intro_plan.get("problem_gap_hypothesis", "N/A")
+        parts = [
+            intro_plan.get("hook_hypothesis", ""),
+            intro_plan.get("problem_gap_hypothesis", ""),
+        ]
+        idea = (self.context_files.get("idea.md") or "").strip()
+        if idea:
+            parts.append(idea[:1200] + ("..." if len(idea) > 1200 else ""))
+        return "\n".join(p for p in parts if p)
+
+    def _generate_queries(self, task, project_brief: str) -> tuple[List[str], List[str]]:
+        """Asks the LLM for short keyword queries plus exact titles of
+        well-known papers. Returns (queries, known_titles)."""
         targeted = task.get("search_type") == "targeted"
-
-        # Step 1: generate search queries.
         if targeted:
-            query_instructions = f"""
-            Identify the SPECIFIC academic paper described by this hint: "{task['focus']}".
-            CONTEXT: {task['context']}
+            # Targeted hints name a specific method/dataset/tool: queries must
+            # be about that thing only, not the project (which drags the
+            # search toward papers that merely use it).
+            prompt = f"""
+            Find the ORIGINAL paper that introduced the thing named in this hint:
+            "{task['focus']}"
 
-            If the hint refers to a dataset, model architecture, or baseline, target the
-            primary, original paper that introduced it.
-            Produce 1-3 search queries for an academic search engine.
-            The first query should be your best guess of the paper's EXACT title; the others
-            short keyword queries.
+            Background (only to understand acronyms and which thing is meant):
+            {project_brief[:600]}
+
+            - "known_titles": the exact title of that original paper, if you know it. The
+              title often differs from the method's name. Else [].
+            - "queries": 2-3 keyword queries (2-6 words) about that thing ONLY:
+              its name; its acronym written out in full words; and what it is.
+              If the hint names a variant or component of a model (e.g. "ViT-L version of
+              CLIP"), query the base model itself ("CLIP contrastive language image").
+              Do not add words about the project or any other topic.
+
+            EXAMPLE: hint "research paper introducing 'BatchNorm layers'"
+            {{"known_titles": ["Batch Normalization: Accelerating Deep Network Training by
+              Reducing Internal Covariate Shift"],
+              "queries": ["batch normalization internal covariate shift"]}}
+
+            Return ONLY json in a ```json``` block: {{"queries": [...], "known_titles": [...]}}
             """
         else:
-            query_instructions = f"""
-            We need 10-15 highly relevant, influential academic papers for this search task.
+            prompt = f"""
+            You write search queries for an academic search engine (keyword matching on
+            titles and abstracts), to find papers for the project below.
+
+            PROJECT:
+            {project_brief}
+
             SEARCH TASK: {task['focus']}
             CONTEXT FOR TASK: {task['context']}
-            BROADER PROJECT PROBLEM: {core_problem}
+            - "known_titles": exact titles of up to 5 well-known papers on this exact topic
+              that you are certain exist (else []).
+            - "queries": 3-5 keyword queries.
 
-            Produce 3-5 diverse, concise keyword queries (3-8 words each) for an academic
-            search engine. Queries may include exact titles of well-known
-            papers you are confident exist.
+            QUERY RULES:
+            - 2-6 words each: technical noun phrases, the way paper titles are written.
+            - Every query must name the specific research area of the project (e.g. the task,
+              modality or model family), so results cannot drift to unrelated fields.
+            - No instruction words: never use "find", "identify", "papers", "research",
+              "highly cited", "foundational", "impact", "survey of", "limitations of".
+            - Vary the wording: synonyms, related task names, method names.
+
+            EXAMPLE (for a different project):
+            Task: "Find highly cited papers establishing the real-world impact of
+            hallucination in LLM summarization"
+            {{"queries": ["abstractive summarization hallucination",
+                          "factual consistency summarization evaluation",
+                          "faithfulness large language model summaries"],
+              "known_titles": ["On Faithfulness and Factuality in Abstractive Summarization"]}}
+
+            Return ONLY json in a ```json``` block: {{"queries": [...], "known_titles": [...]}}
             """
-        query_prompt = (
-            query_instructions
-            + '\nReturn ONLY json in a ```json``` block: {"queries": ["...", "..."]}'
-        )
-        query_response = call_llm_with_contents(
+        response = call_llm_with_contents(
             model_name=self.fast_model_name,
-            contents=[query_prompt],
-            generation_configs={"temperature": 0.2 if targeted else 0.5},
+            contents=[prompt],
+            generation_configs={"temperature": 0.2},
         )
-        parsed = query_response["parsed_response"]
-        queries = parsed.get("queries", []) if isinstance(parsed, dict) else parsed
-        queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()]
-        if not queries:
-            queries = [task["focus"]]
-        queries = queries[: 3 if targeted else 5]
+        parsed = response["parsed_response"]
+        if not isinstance(parsed, dict):
+            parsed = {"queries": parsed if isinstance(parsed, list) else []}
+        queries = [clean_search_query(q) for q in parsed.get("queries") or [] if isinstance(q, str)]
+        known = [t.strip() for t in parsed.get("known_titles") or [] if isinstance(t, str) and t.strip()]
 
-        # Step 2: search scholarly databases (with source fallback).
+        if targeted:
+            # Names quoted in the hint (e.g. 'Segment Anything Model (SAM)') are
+            # the most reliable query of all.
+            for name in re.findall(r"['\"‘“]([^'\"’”]{3,120})['\"’”]", task["focus"]):
+                queries.insert(0, clean_search_query(name))
+        queries = [q for q in dict.fromkeys(queries) if q]
+        if not queries:
+            fallback = clean_search_query(task["focus"])
+            queries = [fallback] if fallback else []
+        return queries[: 3 if targeted else 5], known[: 1 if targeted else 5]
+
+    def _discover_candidates_s2(self, task, outline, cutoff_date) -> list:
+        """Model-agnostic discovery: the LLM writes short keyword queries (and
+        names well-known papers), scholarly databases are searched, and the LLM
+        scores each real result for relevance to the project."""
+        targeted = task.get("search_type") == "targeted"
+        project_brief = self._project_brief(outline)
+        queries, known_titles = self._generate_queries(task, project_brief)
+        self._safe_print(
+            f"      queries for '{task['focus'][:50]}': {queries}"
+            + (f" + known titles {known_titles}" if known_titles else "")
+        )
+
+        # Search: verified known titles first, then keyword results.
         found: Dict[str, Dict] = {}
+        for title in known_titles:
+            hit = title_search(title, None, cutoff_date, require_abstract=True)
+            if hit:
+                found.setdefault(self._normalize_title(hit["title"]), hit)
+            elif targeted:
+                # Near-miss titles still make good keyword queries.
+                guess = clean_search_query(title)
+                if guess and guess not in queries:
+                    queries.insert(0, guess)
+        if targeted:
+            # The original paper often has a short title ("Segment Anything")
+            # that keyword search ranks below its many derivatives; a title
+            # lookup (free, most-cited first) finds it directly.
+            for q in title_lookup_variants(queries[:3])[:4]:
+                for r in title_candidates(q, limit=4, cutoff_date=cutoff_date):
+                    if r.get("abstract"):
+                        found.setdefault(self._normalize_title(r["title"]), r)
+        per_query = 8 if targeted else 10
         for q in queries:
-            for r in keyword_search(
-                q, limit=10 if targeted else 20, cutoff_date=cutoff_date
-            ):
-                if not r.get("abstract"):
-                    continue
-                found.setdefault(self._normalize_title(r["title"]), r)
+            for r in keyword_search(q, limit=per_query, cutoff_date=cutoff_date):
+                if r.get("abstract"):
+                    found.setdefault(self._normalize_title(r["title"]), r)
         if not found:
             return []
+        records = list(found.values())[:30]
 
         listing = []
-        for i, r in enumerate(found.values()):
+        for i, r in enumerate(records):
             abstract = (r.get("abstract") or "").replace("\n", " ")
-            if len(abstract) > 400:
-                abstract = abstract[:400] + "..."
+            if len(abstract) > 300:
+                abstract = abstract[:300] + "..."
             listing.append(
                 f"[{i}] {r['title']} ({r.get('year') or 'n.d.'}; "
                 f"{r.get('venue') or 'unknown venue'}; "
                 f"{r.get('citationCount') or 0} citations)\n    {abstract}"
             )
 
-        # Step 3: select relevant papers from the real search results.
         if targeted:
-            selection_goal = (
-                f'Select EXACTLY 1 paper that best matches the hint "{task["focus"]}" '
-                "(prefer the original paper that introduced the referenced method/dataset). "
-                "If none match, return an empty candidates list."
+            rubric = (
+                f'Score 3 ONLY for the original paper that INTRODUCED what is named in '
+                f'"{task["focus"]}". A paper that merely uses, applies, evaluates or mentions '
+                "it scores 0, even if the name appears in its title. If the hint names a "
+                "variant, size, version or component of a model (e.g. 'ViT-L backbone of "
+                "CLIP'), the original paper of the base model scores 3. If none of the "
+                "results is the original paper, score them all 0."
             )
         else:
-            selection_goal = (
-                "Select up to 15 papers that are strictly relevant to the search task. "
-                "Prefer papers from top-tier venues, highly-cited works, or the exact "
-                "state-of-the-art. Do not force results."
+            rubric = (
+                "3 = directly about the project's research area and this search task; "
+                "2 = same research area, useful context for the task; "
+                "1 = tangential (shares a technique but a different field or task); "
+                "0 = unrelated. Be strict: papers from other fields (medicine, "
+                "recommendation, finance, ...) are 0 even if they share words."
             )
         select_prompt = f"""
+            PROJECT:
+            {project_brief}
+
             SEARCH TASK: {task['focus']}
             CONTEXT FOR TASK: {task['context']}
-            BROADER PROJECT PROBLEM: {core_problem}
-            CUTOFF DATE: Published BEFORE {cutoff_date}
 
             SEARCH RESULTS:
             {chr(10).join(listing)}
 
-            {selection_goal}
-            Copy each selected title EXACTLY as written in the search results.
+            Rate how relevant each search result is for citing in this project's paper.
+            {rubric}
 
-            YOU MUST return the results in json format (```json content```) following this schema:
-            {DiscoveryResult.model_json_schema()}
+            Return ONLY json in a ```json``` block, one entry per result index:
+            {{"scores": [{{"index": 0, "score": 3, "reason": "<few words>"}}, ...]}}
             """
-        response_dict = call_llm_with_contents(
+        response = call_llm_with_contents(
             model_name=self.fast_model_name,
             contents=[select_prompt],
-            generation_configs={"temperature": 0.1 if targeted else 0.3},
+            generation_configs={"temperature": 0.0},
         )
-        parsed = response_dict["parsed_response"]
-        if isinstance(parsed, dict):
-            return parsed.get("candidates", [])
-        return []
+        min_score = 3 if targeted else MIN_RELEVANCE_SCORE
+        selected = []
+        for item in parse_relevance_scores(response["parsed_response"]):
+            index, score = item["index"], item["score"]
+            if 0 <= index < len(records) and score >= min_score:
+                selected.append((score, records[index], item.get("reason", "")))
+        selected.sort(key=lambda x: (x[0], x[1].get("citationCount") or 0), reverse=True)
+        limit = 1 if targeted else 15
+        dropped = len(records) - len(selected)
+        if dropped:
+            self._safe_print(
+                f"      kept {min(len(selected), limit)}/{len(records)} results for "
+                f"'{task['focus'][:50]}' (relevance >= {min_score})"
+            )
+        return [
+            {"title": r["title"], "year": r.get("year"), "reason": reason or task["focus"]}
+            for _, r, reason in selected[:limit]
+        ]
 
     def _synthesize_content(self, outline, papers: List[PaperData], cutoff_date: str):
         paper_keys = [p.citation_key for p in papers]

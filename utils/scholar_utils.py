@@ -613,6 +613,34 @@ def title_search(
     )
 
 
+def title_candidates(query: str, limit: int = 5, cutoff_date: str = None) -> List[Dict]:
+    """Most-cited works whose titles match `query` (OpenAlex autocomplete).
+
+    For finding the original paper behind a name ("Segment Anything"), which
+    keyword search ranks below its many derivatives. Free: autocomplete and
+    per-work lookups do not use the OpenAlex daily budget.
+    """
+    if "openalex" not in get_sources() or _in_cooldown("openalex") or not query:
+        return []
+    try:
+        rsp = _http_get("openalex", OPENALEX_AUTOCOMPLETE_URL, _openalex_params({"q": query}))
+        hits = (rsp.json().get("results") or []) if rsp is not None else []
+        hits = [h for h in hits if h.get("id")]
+        hits.sort(key=lambda h: h.get("cited_by_count") or 0, reverse=True)
+        records = []
+        for h in hits[:limit]:
+            record = _openalex_get_work(h["id"])
+            if record and is_date_valid(
+                record.get("publicationDate"), record.get("year"), cutoff_date
+            ):
+                records.append(record)
+    except SourceUnavailable as e:
+        _start_cooldown("openalex", str(e), e.retry_after)
+        return []
+    _cache_put(records)
+    return records
+
+
 # Backwards-compatible names.
 s2_keyword_search = keyword_search
 s2_title_search = title_search
