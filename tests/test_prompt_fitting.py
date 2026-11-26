@@ -4,7 +4,7 @@ import json
 import pytest
 
 from utils import llm, prompt_fitting as pf
-from utils.llm_parsing import parse_latex_document
+from utils.llm_parsing import make_document_parser, parse_latex_document, splice_sections
 
 
 def _render_factory(n_items=10, abstract_len=1000):
@@ -96,3 +96,25 @@ def test_synthesis_shrinks_to_fit(monkeypatch, tmp_path):
     assert all(p["found_in_section"] == "Introduction" for p in kept[: min(len(kept), 20)])
     assert seen["context"]["citation_checklist"] == [p["citation_key"] for p in kept]
     assert f"{len(kept)}" in seen["system"]
+
+
+TEMPLATE = open("templates/cvpr2025/template.tex").read()
+
+
+def test_splice_sections_into_template():
+    frag = "\\section{Introduction}\n\\label{sec:intro}\nIntro \\cite{a}.\n\n\\section{2. Related Work}\nRW.\n"
+    out = splice_sections(TEMPLATE, frag)
+    assert "Intro \\cite{a}." in out and "RW." in out
+    assert "Introduction here." not in out and "Related work here." not in out
+    assert "Methodology here." in out and out.count("\\section{Introduction}") == 1
+    assert out.rstrip().endswith("\\end{document}")
+    assert splice_sections(TEMPLATE, "\\section{Unrelated}\nx") is None
+    assert splice_sections(TEMPLATE, "no sections at all") is None
+
+
+def test_document_parser_prefers_full_document():
+    parse = make_document_parser(TEMPLATE)
+    full = "```latex\n\\begin{document}\\section{Introduction}x\\end{document}\n```"
+    assert parse(full).startswith("\\begin{document}")
+    assert "\\section{Conclusion}\nDone." in parse("```latex\n\\section{Conclusion}\nDone.\n```")
+    assert parse("Here is a markdown summary.") is None

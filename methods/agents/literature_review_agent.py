@@ -26,7 +26,7 @@ from methods.prompts.literature_review_agent import (
 )
 from utils.llm import is_gemini_model, web_search_tools
 from utils.llm_backend_utils import call_llm_with_contents
-from utils.llm_parsing import parse_latex_document
+from utils.llm_parsing import make_document_parser
 from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
 from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
 from utils.scholar_utils import keyword_search, title_candidates, title_search
@@ -1021,7 +1021,7 @@ class HybridLiteratureAgent:
             model_name=self.model_name,
             contents=[parts["user"], json.dumps(parts["context"])],
             generation_configs={"system_instruction": parts["system"]},
-            result_parsing_func=parse_latex_document,
+            result_parsing_func=make_document_parser(self.context_files.get("template.tex", "")),
         )
         return response_dict["parsed_response"]
 

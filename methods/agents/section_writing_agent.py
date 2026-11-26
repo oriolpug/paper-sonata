@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 
 from methods.prompts.section_writing_agent import section_writing_agent_prompt
 from utils.llm_backend_utils import call_llm_with_images
-from utils.llm_parsing import parse_latex_document
+from utils.llm_parsing import make_document_parser
 from utils.model_defaults import DEFAULT_WRITER_MODEL
 from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
 
@@ -206,7 +206,7 @@ class SectionWritingAgent:
                 "temperature": 0.7,
             },
             model_name=self.model_name,
-            result_parsing_func=parse_latex_document,
+            result_parsing_func=make_document_parser(template_content),
             check_parsed_response_not_none=True,
         )
         cleaned_latex = response_dict["parsed_response"]

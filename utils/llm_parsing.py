@@ -107,6 +107,69 @@ def parse_latex_document(response: str):
     return None
 
 
+_SECTION_RE = re.compile(r"\\section\*?\{([^}]*)\}")
+# Where a template section's body ends if no further \section follows.
+_SECTION_END_RE = re.compile(
+    r"\\section\*?\{|\\appendix\b|\\bibliographystyle\b|\\bibliography\b|"
+    r"\\end\{document\}|^\{\s*$",
+    re.MULTILINE,
+)
+
+
+def _section_key(title: str) -> str:
+    return re.sub(r"[^a-z]", "", re.sub(r"^[\d.\s]+", "", title.lower()))
+
+
+def splice_sections(template: str, fragment: str):
+    """Replaces template sections with same-titled sections from `fragment`.
+
+    Small models often return only the sections they wrote instead of the
+    whole document; this merges them into the template. Returns None if the
+    fragment contains no section that matches the template.
+    """
+    blocks = {}
+    matches = list(_SECTION_RE.finditer(fragment or ""))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(fragment)
+        tail = _SECTION_END_RE.search(fragment, m.end(), end)
+        blocks[_section_key(m.group(1))] = fragment[m.start(): tail.start() if tail else end].rstrip() + "\n\n"
+    if not blocks:
+        return None
+
+    result, replaced, pos = [], 0, 0
+    for m in _SECTION_RE.finditer(template):
+        if m.start() < pos:
+            continue
+        key = _section_key(m.group(1))
+        if key not in blocks:
+            continue
+        end = _SECTION_END_RE.search(template, m.end())
+        end_pos = end.start() if end else len(template)
+        result.append(template[pos:m.start()])
+        result.append(blocks[key])
+        pos = end_pos
+        replaced += 1
+    if not replaced:
+        return None
+    result.append(template[pos:])
+    return "".join(result)
+
+
+def make_document_parser(template: str):
+    """Parser for writing steps: accepts a full LaTeX document, or sections
+    that can be spliced into `template`; otherwise returns None (retry)."""
+
+    def parse(response: str):
+        document = parse_latex_document(response)
+        if document is not None:
+            return document
+        if not template:
+            return None
+        return splice_sections(template, parse_latex(response))
+
+    return parse
+
+
 def parse_json_latex(response_text: str) -> str:
     """
     Extracts the JSON worklog and the LaTeX code from the LLM response.
