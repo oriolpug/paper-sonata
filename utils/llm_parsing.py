@@ -97,6 +97,16 @@ def parse_latex(response: str):
     return response
 
 
+def parse_latex_document(response: str):
+    """Like parse_latex, but returns None unless the result is a complete
+    LaTeX document, so callers retry instead of saving prose or a truncated
+    answer (common when a small model loses its instructions)."""
+    latex = parse_latex(response)
+    if "\\begin{document}" in latex and "\\end{document}" in latex:
+        return latex
+    return None
+
+
 def parse_json_latex(response_text: str) -> str:
     """
     Extracts the JSON worklog and the LaTeX code from the LLM response.

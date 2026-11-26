@@ -302,6 +302,69 @@ def build_messages(
     return messages
 
 
+class PromptTooLongError(Exception):
+    """The prompt does not fit the model's context window."""
+
+
+def context_window(model_name: str) -> Optional[int]:
+    """Input context size in tokens, or None if unknown/very large.
+
+    PAPER_CONTEXT_WINDOW overrides; Ollama models use PAPER_OLLAMA_NUM_CTX
+    (the size we request), since their server-side default is much smaller.
+    """
+    override = os.getenv("PAPER_CONTEXT_WINDOW")
+    if override:
+        return int(override)
+    model = normalize_model_name(model_name)
+    if get_provider(model) in ("ollama", "ollama_chat"):
+        return int(os.getenv("PAPER_OLLAMA_NUM_CTX", "32768"))
+    if is_chatgpt_plan_model(model):
+        return None
+    try:
+        info = litellm.get_model_info(model)
+    except Exception:
+        return None
+    return info.get("max_input_tokens") or info.get("max_tokens")
+
+
+def count_tokens(model_name: str, text: str) -> int:
+    """Approximate token count (exact for models LiteLLM has a tokenizer for)."""
+    try:
+        return int(litellm.token_counter(model=normalize_model_name(model_name), text=text))
+    except Exception:
+        return len(text) // 3
+
+
+def prompt_budget(model_name: str, output_reserve: int) -> Optional[int]:
+    """Tokens available for the prompt after reserving room for the answer,
+    or None when the window is unknown or large enough not to matter."""
+    window = context_window(model_name)
+    if not window or window >= 200_000:
+        return None
+    return max(window - output_reserve, window // 4)
+
+
+def _check_prompt_fits(model: str, messages: List[Dict[str, Any]]):
+    """Ollama silently drops the start of prompts that exceed num_ctx (losing
+    the instructions), so fail loudly instead."""
+    if get_provider(model) not in ("ollama", "ollama_chat"):
+        return
+    window = context_window(model)
+    text = "\n".join(
+        m["content"] if isinstance(m["content"], str)
+        else "\n".join(b.get("text", "") for b in m["content"] if isinstance(b, dict))
+        for m in messages
+    )
+    used = count_tokens(model, text)
+    if window and used > window:
+        raise PromptTooLongError(
+            f"Prompt is ~{used} tokens but '{model}' has a {window}-token context "
+            "(PAPER_OLLAMA_NUM_CTX). Ollama would silently truncate it. Raise "
+            "PAPER_OLLAMA_NUM_CTX if the model and memory allow, or use a "
+            "larger-context model."
+        )
+
+
 def _completion_kwargs(model_name: str) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     provider = get_provider(model_name)
@@ -391,6 +454,7 @@ def call_llm(
     parsed_response = None
     drop_images = False
     messages = build_messages(contents, model, system_prompt)
+    _check_prompt_fits(model, messages)
 
     chatgpt_plan = is_chatgpt_plan_model(model)
     if chatgpt_plan:
@@ -430,6 +494,7 @@ def call_llm(
             litellm.ContextWindowExceededError,
             litellm.AuthenticationError,
             litellm.NotFoundError,
+            PromptTooLongError,
             *non_retryable,
         ) as e:
             print(f"Error: LLM call (model={model}) failed with non-retryable error: {e}")

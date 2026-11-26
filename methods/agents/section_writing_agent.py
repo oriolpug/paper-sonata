@@ -30,15 +30,17 @@ Output:
 """
 
 import json
-from typing import List, Dict
+import os
+from typing import Dict, List, Optional
 
 from methods.prompts.section_writing_agent import section_writing_agent_prompt
 from utils.llm_backend_utils import call_llm_with_images
-from utils.llm_parsing import parse_latex
+from utils.llm_parsing import parse_latex_document
 from utils.model_defaults import DEFAULT_WRITER_MODEL
+from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
 
-import json
-from typing import List, Dict
+# Tokens reserved for the answer: the full LaTeX paper.
+SECTION_OUTPUT_RESERVE = 12288
 
 
 class SectionWritingAgent:
@@ -106,7 +108,9 @@ class SectionWritingAgent:
             context += "--------------------------------------------------\n"
         return context
 
-    def _format_citation_library(self, citation_map: Dict) -> str:
+    def _format_citation_library(
+        self, citation_map: Dict, abstract_chars: Optional[int] = None
+    ) -> str:
         if not citation_map:
             return "No citation data provided."
 
@@ -118,7 +122,9 @@ class SectionWritingAgent:
             if len(authors_list) > 3:
                 authors += " et al."
             year = data.get("year", "N/A")
-            abstract = data.get("abstract", "No abstract available.")
+            abstract = truncate_abstract(
+                data.get("abstract", "No abstract available."), abstract_chars
+            ) or "(omitted)"
 
             context += f"--- Key: {key} ---\n"
             context += f"Title: {title}\n"
@@ -136,13 +142,10 @@ class SectionWritingAgent:
             log_content = self._read_file(self.experimental_log_path)
             guidelines_content = self._read_file(self.guidelines_path)
 
-            citation_map = self._read_json(self.citation_map_path)
-            citation_library_content = self._format_citation_library(citation_map)
+            citation_map = self._read_json(self.citation_map_path) or {}
 
             figures_info = self._read_json(self.figures_info_path)
             figures_content = self._format_figures_context(figures_info)
-
-            import os
 
             figures_dir = os.path.dirname(self.figures_info_path)
             image_paths = []
@@ -165,7 +168,61 @@ class SectionWritingAgent:
         except Exception as e:
             return f"Error reading input files: {str(e)}"
 
-        user_prompt = f"""
+        # Keys the outline already assigns to sections come first: they are
+        # kept longest if the library must shrink to fit a small context.
+        ordered_keys = sorted(
+            citation_map, key=lambda k: f'"{k}"' not in outline_content
+        )
+
+        def render(abstract_chars, n):
+            library = self._format_citation_library(
+                {k: citation_map[k] for k in ordered_keys[:n]}, abstract_chars
+            )
+            return self.system_prompt + self._build_user_prompt(
+                outline_content, library, idea_content, log_content,
+                figures_content, guidelines_content, template_content,
+            )
+
+        _, abstract_chars, n = fit_papers(
+            self.model_name, render, len(ordered_keys), output_reserve=SECTION_OUTPUT_RESERVE
+        )
+        note = describe_fit(len(ordered_keys), abstract_chars, n)
+        if note:
+            print(f" > {note}")
+        citation_library_content = self._format_citation_library(
+            {k: citation_map[k] for k in ordered_keys[:n]}, abstract_chars
+        )
+        user_prompt = self._build_user_prompt(
+            outline_content, citation_library_content, idea_content, log_content,
+            figures_content, guidelines_content, template_content,
+        )
+
+        print(" > Generating paper content with Multimodal Images...")
+        response_dict = call_llm_with_images(
+            prompt=user_prompt,
+            images=image_paths,
+            generation_configs={
+                "system_instruction": self.system_prompt,
+                "temperature": 0.7,
+            },
+            model_name=self.model_name,
+            result_parsing_func=parse_latex_document,
+            check_parsed_response_not_none=True,
+        )
+        cleaned_latex = response_dict["parsed_response"]
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_latex)
+
+        print(f" > Paper saved to {output_path}")
+        return cleaned_latex
+
+    @staticmethod
+    def _build_user_prompt(
+        outline_content, citation_library_content, idea_content, log_content,
+        figures_content, guidelines_content, template_content,
+    ) -> str:
+        return f"""
 Here are the input materials for the paper.
 
 --- INPUT: outline.json (Structure & Citation Candidates) ---
@@ -197,23 +254,3 @@ Here are the input materials for the paper.
 5. Use citations from the Reference Library.
 6. Return the **full** compilable LaTeX file.
 """
-
-        print(" > Generating paper content with Multimodal Images...")
-        response_dict = call_llm_with_images(
-            prompt=user_prompt,
-            images=image_paths,
-            generation_configs={
-                "system_instruction": self.system_prompt,
-                "temperature": 0.7,
-            },
-            model_name=self.model_name,
-            result_parsing_func=parse_latex,
-            check_parsed_response_not_none=True,
-        )
-        cleaned_latex = response_dict["parsed_response"]
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(cleaned_latex)
-
-        print(f" > Paper saved to {output_path}")
-        return cleaned_latex

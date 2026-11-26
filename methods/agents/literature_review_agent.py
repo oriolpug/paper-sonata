@@ -26,13 +26,16 @@ from methods.prompts.literature_review_agent import (
 )
 from utils.llm import is_gemini_model, web_search_tools
 from utils.llm_backend_utils import call_llm_with_contents
-from utils.llm_parsing import parse_latex
+from utils.llm_parsing import parse_latex_document
+from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
 from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
 from utils.scholar_utils import keyword_search, title_candidates, title_search
 
 SEARCH_BACKENDS = ("auto", "google", "s2")
 # LLM-assisted recovery attempts per run for candidates not found by title.
 DEFAULT_MAX_CITATION_RECOVERIES = int(os.getenv("PAPER_MAX_CITATION_RECOVERIES", "40"))
+# Tokens reserved for the Introduction/Related Work LaTeX answer.
+SYNTHESIS_OUTPUT_RESERVE = 8192
 
 
 # Minimum LLM relevance score (0-3) for exploration results to be kept.
@@ -972,32 +975,53 @@ class HybridLiteratureAgent:
         ]
 
     def _synthesize_content(self, outline, papers: List[PaperData], cutoff_date: str):
-        paper_keys = [p.citation_key for p in papers]
-        papers_payload = [p.model_dump() for p in papers]
+        # Papers found for the Introduction / Related Work first, then by
+        # citations: the order in which they are dropped if the prompt must
+        # shrink to fit a small context window.
+        def priority(p: PaperData):
+            for_intro_rw = p.found_in_section.startswith(("Introduction", "Related Work"))
+            return (not for_intro_rw, -(p.citation_count or 0))
 
-        context_payload = {
-            "template.tex": self.context_files.get("template.tex", ""),
-            "intro_related_work_plan": outline.get("intro_related_work_plan", {}),
-            "project_idea": self.context_files.get("idea.md", ""),
-            "project_experimental_log": self.context_files.get(
-                "experimental_log.md", ""
-            ),
-            "citation_checklist": paper_keys,
-            "collected_papers": papers_payload,
-        }
-
-        writer_system_prompt = literature_review_agent_writter_prompt.format(
-            paper_count=len(papers),
-            min_cite_paper_count=int(len(papers) * 0.9),
-            cutoff_date=cutoff_date,
-        )
-
+        ordered = sorted(papers, key=priority)
         user_prompt = "Generate the LaTeX for Introduction and Related Work sections."
+
+        def render(abstract_chars, n):
+            chosen = ordered[:n]
+            payload = []
+            for p in chosen:
+                item = p.model_dump()
+                item["abstract"] = truncate_abstract(p.abstract, abstract_chars)
+                payload.append(item)
+            context_payload = {
+                "template.tex": self.context_files.get("template.tex", ""),
+                "intro_related_work_plan": outline.get("intro_related_work_plan", {}),
+                "project_idea": self.context_files.get("idea.md", ""),
+                "project_experimental_log": self.context_files.get(
+                    "experimental_log.md", ""
+                ),
+                "citation_checklist": [p.citation_key for p in chosen],
+                "collected_papers": payload,
+            }
+            system = literature_review_agent_writter_prompt.format(
+                paper_count=len(chosen),
+                min_cite_paper_count=int(len(chosen) * 0.9),
+                cutoff_date=cutoff_date,
+            )
+            return json.dumps({"system": system, "user": user_prompt, "context": context_payload})
+
+        rendered, abstract_chars, n = fit_papers(
+            self.model_name, render, len(ordered), output_reserve=SYNTHESIS_OUTPUT_RESERVE
+        )
+        note = describe_fit(len(ordered), abstract_chars, n)
+        if note:
+            self._safe_print(f"      {note}")
+        parts = json.loads(rendered)
+
         response_dict = call_llm_with_contents(
             model_name=self.model_name,
-            contents=[user_prompt, json.dumps(context_payload)],
-            generation_configs={"system_instruction": writer_system_prompt},
-            result_parsing_func=parse_latex,
+            contents=[parts["user"], json.dumps(parts["context"])],
+            generation_configs={"system_instruction": parts["system"]},
+            result_parsing_func=parse_latex_document,
         )
         return response_dict["parsed_response"]
 
