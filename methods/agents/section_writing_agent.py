@@ -39,6 +39,7 @@ from utils.latex_cleanup import (
     clean_generated_latex,
     ensure_figures_included,
     find_copied_examples,
+    resolve_figure_files,
 )
 from utils.llm_parsing import make_document_parser
 from utils.model_defaults import DEFAULT_WRITER_MODEL
@@ -220,6 +221,11 @@ class SectionWritingAgent:
         cleaned_latex, fixes = clean_generated_latex(
             response_dict["parsed_response"], citation_map.keys()
         )
+        existing_figures = os.listdir(figures_dir) if os.path.isdir(figures_dir) else []
+        cleaned_latex, figure_fixes = resolve_figure_files(
+            cleaned_latex, existing_figures, figures_info
+        )
+        fixes += figure_fixes
         cleaned_latex, figure_fixes = ensure_figures_included(cleaned_latex, figures_info)
         fixes += figure_fixes
         for fix in fixes:

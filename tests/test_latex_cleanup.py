@@ -71,3 +71,52 @@ def test_document_parser_rejects_invalid_documents():
     parse = make_document_parser("", validate=lambda d: ["bad"] if "Frob" in d else [])
     assert parse("```latex\n\\begin{document}Frob\\end{document}\n```") is None
     assert parse("```latex\n\\begin{document}ok\\end{document}\n```") == "\\begin{document}ok\\end{document}"
+
+
+def test_fix_markdown_artifacts():
+    from utils.latex_cleanup import fix_markdown_artifacts as f
+
+    md = ("The branch works as follows:\n"
+          "1. **Sequential Processing:** reads frames.\n"
+          "2. **Cached Memory & Adapters:** stores state.\n"
+          "Then more text.")
+    out = f(md)
+    assert "\\begin{enumerate}\n  \\item \\textbf{Sequential Processing:} reads frames." in out
+    assert "\\textbf{Cached Memory \\& Adapters:}" in out and "\\end{enumerate}\nThen more text." in out
+
+    table = "\\begin{tabular}{lc}\nSetting & Mix(S+U) J(%) \\\\\nA & 49.01 \\\\\n\\end{tabular}"
+    out = f(table)
+    assert "Setting & Mix(S+U) J(\\%)" in out and "A & 49.01" in out
+
+    eq = "\\begin{align} a &= b \\\\ c &= d \\end{align} and R&D gains 5% % a comment"
+    out = f(eq)
+    assert "a &= b" in out and "R\\&D" in out and "5\\%" in out and " % a comment" in out
+    assert f("%%%%%%%%% INTRODUCTION %%%%%%%%%") == "%%%%%%%%% INTRODUCTION %%%%%%%%%"
+    assert f("Already \\& and 3\\% fine") == "Already \\& and 3\\% fine"
+    assert f("$2 * 3$ and a*b") == "$2 * 3$ and a*b"
+
+
+def test_markdown_lists_not_converted_inside_tables():
+    from utils.latex_cleanup import fix_markdown_artifacts as f
+
+    table = "\\begin{tabular}{lc}\n    - TB & 41.77 \\\\\n    - TMFL & 42.95 \\\\\n\\end{tabular}"
+    assert f(table) == table
+    assert "\\begin{itemize}" in f("Points:\n- one\n- two\n")
+
+
+def test_resolve_figure_files():
+    from utils.latex_cleanup import resolve_figure_files
+
+    cap = "Overview of TSAM. Left: multimodal cues. Right: temporal branch."
+    tex = ("Text.\n\\begin{figure}\n\\includegraphics[width=\\linewidth]{figures/tsam_overview.png}\n"
+           f"\\caption{{{cap}}}\n\\label{{fig:a}}\n\\end{{figure}}\n"
+           "\\begin{figure*}\n\\includegraphics{figures/invented_plot.png}\n\\caption{Accuracy plot}\n\\end{figure*}\n"
+           "\\begin{figure}\n\\includegraphics{figures/real.png}\n\\caption{Real}\n\\end{figure}\n"
+           "Inline \\includegraphics{figures/ghost.pdf} here.")
+    out, changes = resolve_figure_files(
+        tex, ["real.png", "cvpr_example_figure.png"],
+        [{"name": "cvpr_example_figure.png", "caption": cap}, {"name": "real.png", "caption": "Real"}])
+    assert "figures/cvpr_example_figure.png" in out and "tsam_overview" not in out
+    assert "invented_plot" not in out and "Accuracy plot" not in out
+    assert "figures/real.png" in out and "ghost.pdf" not in out
+    assert len(changes) == 3

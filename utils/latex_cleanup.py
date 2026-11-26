@@ -17,7 +17,7 @@
 import re
 from typing import Dict, Iterable, List, Tuple
 
-from thefuzz import process  # type: ignore
+from thefuzz import fuzz, process  # type: ignore
 
 # Minimum fuzzy similarity (0-100) to map an unknown citation key to a real one.
 KEY_MATCH_THRESHOLD = 88
@@ -71,8 +71,80 @@ def strip_manual_section_numbers(latex: str) -> str:
     return _NUMBERED_TITLE_RE.sub(r"\1", latex)
 
 
+# Environments in which "&" is a legitimate column separator.
+_ALIGN_ENVS = (
+    "tabular", "tabularx", "tabular*", "longtable", "array", "align", "align*",
+    "aligned", "alignat", "alignat*", "eqnarray", "eqnarray*", "matrix", "pmatrix",
+    "bmatrix", "vmatrix", "Vmatrix", "smallmatrix", "cases", "split", "gather",
+    "gather*", "flalign", "flalign*", "tblr",
+)
+_ENV_RE = re.compile(r"\\(begin|end)\{([^}]*)\}")
+
+
+def _escape_stray_ampersands(latex: str) -> str:
+    out, depth, pos = [], 0, 0
+    for m in _ENV_RE.finditer(latex):
+        chunk = latex[pos:m.start()]
+        out.append(chunk if depth else re.sub(r"(?<!\\)&", r"\\&", chunk))
+        out.append(m.group(0))
+        if m.group(2) in _ALIGN_ENVS:
+            depth += 1 if m.group(1) == "begin" else -1
+            depth = max(depth, 0)
+        pos = m.end()
+    tail = latex[pos:]
+    out.append(tail if depth else re.sub(r"(?<!\\)&", r"\\&", tail))
+    return "".join(out)
+
+
+def _lines_inside_environments(lines: List[str]) -> List[bool]:
+    """True for lines inside a table/alignment/math environment."""
+    flags, depth = [], 0
+    for line in lines:
+        start_depth = depth
+        for m in _ENV_RE.finditer(line):
+            if m.group(2) in _ALIGN_ENVS or m.group(2) in ("equation", "equation*", "math", "displaymath"):
+                depth = max(depth + (1 if m.group(1) == "begin" else -1), 0)
+        flags.append(start_depth > 0 or depth > 0)
+    return flags
+
+
+def _markdown_lists_to_latex(latex: str) -> str:
+    lines, out, i = latex.split("\n"), [], 0
+    inside = _lines_inside_environments(lines)
+    patterns = (("enumerate", re.compile(r"^\s*\d+[.)]\s+(.*)$")), ("itemize", re.compile(r"^\s*[-*]\s+(.*)$")))
+
+    def is_item(pat, j):
+        return j < len(lines) and not inside[j] and pat.match(lines[j])
+
+    while i < len(lines):
+        for env, pat in patterns:
+            if is_item(pat, i) and (is_item(pat, i + 1) or (env == "enumerate" and lines[i].lstrip().startswith("1"))):
+                items = []
+                while is_item(pat, i):
+                    items.append("  \\item " + pat.match(lines[i]).group(1))
+                    i += 1
+                out.append(f"\\begin{{{env}}}\n" + "\n".join(items) + f"\n\\end{{{env}}}")
+                break
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+def fix_markdown_artifacts(latex: str) -> str:
+    """Fixes Markdown that small models mix into LaTeX: **bold**, Markdown
+    lists, bare "&" in running text, and "%" glued to text (e.g. "J(%)",
+    "5%"), which LaTeX would treat as a comment."""
+    latex = re.sub(r"(?<![\\*])\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*(?!\*)", r"\\textbf{\1}", latex)
+    latex = _markdown_lists_to_latex(latex)
+    latex = _escape_stray_ampersands(latex)
+    latex = re.sub(r"(?<=[\w(])%", r"\\%", latex)
+    return latex
+
+
 def clean_generated_latex(latex: str, valid_keys: Iterable[str]) -> Tuple[str, List[str]]:
     latex = strip_manual_section_numbers(latex)
+    latex = fix_markdown_artifacts(latex)
     return fix_citation_keys(latex, valid_keys)
 
 
@@ -161,3 +233,54 @@ def find_copied_examples(latex: str, guidelines: str, template: str = "") -> Lis
     if left:
         problems.append(f"template placeholders left: {left}")
     return problems
+
+
+_FIGURE_ENV_RE = re.compile(r"\\begin\{(figure\*?)\}.*?\\end\{\1\}", re.S)
+_INCLUDE_RE = re.compile(r"(\\includegraphics\s*(?:\[[^\]]*\])?\s*\{)([^}]*)(\})")
+
+
+def resolve_figure_files(
+    latex: str, existing_files: Iterable[str], figures: List[Dict], figures_dir: str = "figures"
+) -> Tuple[str, List[str]]:
+    """Handles \\includegraphics of files that do not exist (models invent
+    names, e.g. from a plotting plan that was never executed).
+
+    A figure whose caption matches a provided figure's caption is pointed at
+    that file; otherwise the figure environment is removed.
+    """
+    existing = set(existing_files)
+    captions = {f.get("name"): f.get("caption", "") for f in figures or [] if f.get("name") in existing}
+    used = {m.group(2).rsplit("/", 1)[-1] for m in _INCLUDE_RE.finditer(latex)} & existing
+    changes: List[str] = []
+
+    def fix_env(m: re.Match) -> str:
+        env = m.group(0)
+        inc = _INCLUDE_RE.search(env)
+        if not inc or inc.group(2).rsplit("/", 1)[-1] in existing:
+            return env
+        missing = inc.group(2)
+        cap = re.search(r"\\caption\{(.*)\}", env, re.S)
+        caption = cap.group(1) if cap else ""
+        best, score = None, 0
+        for name, real_caption in captions.items():
+            if name in used or not real_caption:
+                continue
+            s = fuzz.token_set_ratio(caption, real_caption)
+            if s > score:
+                best, score = name, s
+        if best and score >= 80:
+            used.add(best)
+            changes.append(f"figure '{missing}' does not exist; pointed it at '{best}' (matching caption)")
+            return env[: inc.start(2)] + f"{figures_dir}/{best}" + env[inc.end(2):]
+        changes.append(f"removed figure with missing file '{missing}'")
+        return ""
+
+    latex = _FIGURE_ENV_RE.sub(fix_env, latex)
+
+    def fix_bare(m: re.Match) -> str:
+        if m.group(2).rsplit("/", 1)[-1] in existing:
+            return m.group(0)
+        changes.append(f"removed \\includegraphics of missing file '{m.group(2)}'")
+        return ""
+
+    return _INCLUDE_RE.sub(fix_bare, latex), changes
