@@ -155,6 +155,44 @@ def splice_sections(template: str, fragment: str):
     return "".join(result)
 
 
+_MARKER_RE = re.compile(r"^%{3,}\s*([A-Za-z][A-Za-z \-]*?)\s*%{3,}\s*$", re.MULTILINE)
+
+
+def splice_marked_blocks(template: str, fragment: str):
+    """Fills template placeholders delimited by comment markers such as
+    `%%%%%%%%% INTRODUCTION %%%%%%%%%` with the text that follows the same
+    marker in `fragment`. Returns None if no marker matches."""
+    blocks = {}
+    marks = list(_MARKER_RE.finditer(fragment or ""))
+    for i, m in enumerate(marks):
+        name = m.group(1).strip().upper()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(fragment)
+        body = fragment[m.end():end].strip("\n")
+        if body.strip() and name not in blocks:
+            blocks[name] = body
+    if not blocks:
+        return None
+
+    result, pos, replaced = [], 0, 0
+    marks = list(_MARKER_RE.finditer(template))
+    i = 0
+    while i < len(marks) - 1:
+        opening, closing = marks[i], marks[i + 1]
+        name = opening.group(1).strip().upper()
+        if name == closing.group(1).strip().upper() and name in blocks:
+            result.append(template[pos:opening.end()])
+            result.append("\n" + blocks[name] + "\n")
+            pos = closing.start()
+            replaced += 1
+            i += 2
+        else:
+            i += 1
+    if not replaced:
+        return None
+    result.append(template[pos:])
+    return "".join(result)
+
+
 def make_document_parser(template: str):
     """Parser for writing steps: accepts a full LaTeX document, or sections
     that can be spliced into `template`; otherwise returns None (retry)."""
@@ -165,7 +203,8 @@ def make_document_parser(template: str):
             return document
         if not template:
             return None
-        return splice_sections(template, parse_latex(response))
+        fragment = parse_latex(response)
+        return splice_sections(template, fragment) or splice_marked_blocks(template, fragment)
 
     return parse
 

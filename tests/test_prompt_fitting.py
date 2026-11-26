@@ -4,7 +4,9 @@ import json
 import pytest
 
 from utils import llm, prompt_fitting as pf
-from utils.llm_parsing import make_document_parser, parse_latex_document, splice_sections
+from utils.llm_parsing import (
+    make_document_parser, parse_latex_document, splice_marked_blocks, splice_sections,
+)
 
 
 def _render_factory(n_items=10, abstract_len=1000):
@@ -118,3 +120,17 @@ def test_document_parser_prefers_full_document():
     assert parse(full).startswith("\\begin{document}")
     assert "\\section{Conclusion}\nDone." in parse("```latex\n\\section{Conclusion}\nDone.\n```")
     assert parse("Here is a markdown summary.") is None
+
+
+def test_splice_marked_blocks():
+    frag = ("%%%%%%%%% INTRODUCTION %%%%%%%%%\nIntro text \\cite{a}.\n\n"
+            "%%%%%%%%% RELATED WORK %%%%%%%%%\n\\subsection{Static}\nRW text.\n")
+    out = splice_marked_blocks(TEMPLATE, frag)
+    assert "Intro text \\cite{a}." in out and "RW text." in out
+    assert "Introduction here." not in out and "Related work here." not in out
+    assert "Methodology here." in out
+    i = out.index("\\section{Introduction}")
+    assert out.index("Intro text") > i and out.index("Intro text") < out.index("\\section{Related Work}")
+    assert out.count("%%%%%%%%% INTRODUCTION %%%%%%%%%") == 2  # markers preserved
+    assert make_document_parser(TEMPLATE)("```latex\n" + frag + "```") == out
+    assert splice_marked_blocks(TEMPLATE, "no markers") is None
