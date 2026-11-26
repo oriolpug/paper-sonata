@@ -26,6 +26,7 @@ from methods.prompts.literature_review_agent import (
 )
 from utils.llm import is_gemini_model, web_search_tools
 from utils.llm_backend_utils import call_llm_with_contents
+from utils.latex_cleanup import clean_generated_latex
 from utils.llm_parsing import make_document_parser
 from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
 from utils.model_defaults import DEFAULT_FAST_MODEL, DEFAULT_WRITER_MODEL
@@ -251,6 +252,11 @@ class HybridLiteratureAgent:
         latex_content = self._synthesize_content(
             updated_outline, final_papers_list, cutoff_date
         )
+        latex_content, fixes = clean_generated_latex(
+            latex_content, [p.citation_key for p in final_papers_list]
+        )
+        for fix in fixes:
+            self._safe_print(f"      🔧 {fix}")
 
         # --- PHASE 4: SAVING ---
         self._save_outputs(

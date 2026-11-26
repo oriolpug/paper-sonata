@@ -35,6 +35,7 @@ from typing import Dict, List, Optional
 
 from methods.prompts.section_writing_agent import section_writing_agent_prompt
 from utils.llm_backend_utils import call_llm_with_images
+from utils.latex_cleanup import clean_generated_latex
 from utils.llm_parsing import make_document_parser
 from utils.model_defaults import DEFAULT_WRITER_MODEL
 from utils.prompt_fitting import describe_fit, fit_papers, truncate_abstract
@@ -209,7 +210,11 @@ class SectionWritingAgent:
             result_parsing_func=make_document_parser(template_content),
             check_parsed_response_not_none=True,
         )
-        cleaned_latex = response_dict["parsed_response"]
+        cleaned_latex, fixes = clean_generated_latex(
+            response_dict["parsed_response"], citation_map.keys()
+        )
+        for fix in fixes:
+            print(f" > 🔧 {fix}")
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(cleaned_latex)
