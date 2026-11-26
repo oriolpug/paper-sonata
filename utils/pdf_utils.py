@@ -168,26 +168,8 @@ def get_paper_references_from_pdf(
     return None
 
 
-def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
-    import os, shutil, subprocess, traceback, rich
-
-    source_pdf = os.path.join(cwd, f"{texfile_name}.pdf")
-    if os.path.exists(source_pdf):
-        os.remove(source_pdf)
-
-    env = dict(os.environ)
-    for var in ["TEXINPUTS", "TEXMFHOME", "TEXMF", "TEXMFVAR", "TEXMFCONFIG"]:
-        env.pop(var, None)
-
-    commands = [
-        ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
-        ["bibtex", texfile_name],
-        ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
-        ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
-    ]
-
+def _run_latex_commands(commands, cwd, timeout, env):
     execution_logs = []
-
     for command in commands:
         cmd_str = " ".join(command)
         try:
@@ -199,7 +181,6 @@ def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
                 timeout=timeout,
                 env=env,
             )
-
             execution_logs.append(
                 {
                     "cmd": cmd_str,
@@ -208,13 +189,54 @@ def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
                     "stderr": result.stderr,
                 }
             )
-
         except subprocess.TimeoutExpired:
-            execution_logs.append(
-                {"cmd": cmd_str, "error": f"TIMEOUT after {timeout}s"}
-            )
+            execution_logs.append({"cmd": cmd_str, "error": f"TIMEOUT after {timeout}s"})
         except Exception as e:
             execution_logs.append({"cmd": cmd_str, "error": str(e)})
+    return execution_logs
+
+
+def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
+    """Compiles `texfile_name`.tex in `cwd` and moves the PDF to `pdf_file`.
+
+    PAPER_LATEX_ENGINE selects the toolchain: "pdflatex" (pdflatex + bibtex),
+    "tectonic" (self-contained engine that fetches packages on demand), or
+    "auto" (default): pdflatex if it produces a PDF, otherwise tectonic.
+    """
+    source_pdf = os.path.join(cwd, f"{texfile_name}.pdf")
+    if os.path.exists(source_pdf):
+        os.remove(source_pdf)
+
+    env = dict(os.environ)
+    for var in ["TEXINPUTS", "TEXMFHOME", "TEXMF", "TEXMFVAR", "TEXMFCONFIG"]:
+        env.pop(var, None)
+
+    engine = os.environ.get("PAPER_LATEX_ENGINE", "auto").strip().lower()
+    execution_logs = []
+
+    if engine in ("auto", "pdflatex") and shutil.which("pdflatex"):
+        execution_logs += _run_latex_commands(
+            [
+                ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
+                ["bibtex", texfile_name],
+                ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
+                ["pdflatex", "-interaction=nonstopmode", f"{texfile_name}.tex"],
+            ],
+            cwd, timeout, env,
+        )
+
+    if not os.path.exists(source_pdf) and engine in ("auto", "tectonic") and shutil.which("tectonic"):
+        # Runs bibtex and reruns itself as needed. The first run downloads
+        # LaTeX packages, hence the longer timeout.
+        execution_logs += _run_latex_commands(
+            [["tectonic", "--keep-logs", f"{texfile_name}.tex"]],
+            cwd, max(timeout, 300), env,
+        )
+
+    if not execution_logs:
+        execution_logs.append(
+            {"cmd": f"(engine={engine})", "error": "No LaTeX engine found: install TeX Live/MiKTeX (pdflatex) or tectonic."}
+        )
 
     has_timeout = any(
         "error" in log and "TIMEOUT" in log["error"] for log in execution_logs

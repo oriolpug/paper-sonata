@@ -20,7 +20,7 @@ Acting like an orchestrated team of specialized agents, it handles outline gener
 
 ## Installation
 
-No conda required. A LaTeX distribution providing `pdflatex`/`bibtex` (e.g. TeX Live or MacTeX) must be on your `PATH` to compile papers.
+No conda required. To compile papers you need either a LaTeX distribution providing `pdflatex`/`bibtex` (TeX Live, MacTeX, MiKTeX) or [Tectonic](https://tectonic-typesetting.github.io/) (`brew install tectonic`; self-contained, downloads LaTeX packages on demand). By default `pdflatex` is tried first and Tectonic is used if it produces no PDF; set `PAPER_LATEX_ENGINE=pdflatex|tectonic` to force one.
 
 1.  **Environment Setup** (Python >= 3.11). Recommended, with [uv](https://docs.astral.sh/uv/):
     ```bash
